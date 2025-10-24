@@ -132,7 +132,7 @@ def make_grad_fn_factory(seed: int = 0, lr: float = 0.5):
         rng2 = np.random.RandomState(seed + uid)
         return rng2.normal(loc=uid * 0.05, scale=0.5, size=m)
 
-    def make_grad_fn(x_prev: np.ndarray, uid: int) -> np.ndarray:
+    def make_grad_fn(x_prev: np.ndarray, uid: int, round_t: int) -> np.ndarray:
         m = x_prev.size
         mu_i = make_mu(uid, m)
         # 简单一阶“朝向本地最优”的步进 + 少量噪声
@@ -148,10 +148,27 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
              offline_uid: int | None = None, offline_from_round: int = 10**9,
              lr: float = 0.1, local_epochs: int = 1, batch: int = 256,
              b_mode: str = "per_round", auto_download: bool = True,
-             log_weights: bool = False, log_local_eval: bool = False):
+             log_weights: bool = False, log_local_eval: bool = False,
+             faulty_uids: list[int] | None = None, faulty_mode: str = "none",
+             faulty_std: float = 0.5):
     assert 1 <= t_thr <= n_clients, "threshold t must satisfy 1 <= t <= n_clients"
 
     ff = FixedField()
+    faulty_uids = faulty_uids or []
+    faulty_mode = (faulty_mode or "none").lower()
+    faulty_set = set(faulty_uids)
+    faulty_rngs = {uid: np.random.RandomState(seed + 12345 + uid) for uid in faulty_set}
+
+    def apply_faulty_behavior(x_prev_vec: np.ndarray, x_vec: np.ndarray, uid: int) -> np.ndarray:
+        if uid not in faulty_set:
+            return x_vec
+        if faulty_mode == "sign_flip":
+            return x_prev_vec - (x_vec - x_prev_vec)
+        if faulty_mode == "gaussian":
+            noise = faulty_rngs[uid].normal(loc=0.0, scale=faulty_std, size=x_prev_vec.shape)
+            return x_prev_vec + noise
+        # label_noise 或未知模式直接返回（label_noise 在训练时处理）
+        return x_vec
     # Reproducibility (best-effort)
     np.random.seed(seed)
     try:
@@ -169,7 +186,7 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         client_loaders, test_loader = build_mnist_loaders(n_clients, batch)
 
         # 本地训练函数：从向量加载模型，训练若干 epoch，返回更新后的参数向量
-        def make_grad_fn(x_prev: np.ndarray, uid: int) -> np.ndarray:
+        def make_grad_fn(x_prev: np.ndarray, uid: int, round_t: int) -> np.ndarray:
             model = SimpleCNN().to(device)
             torch_vector_to_parameters(model, x_prev)
             model.train()
@@ -178,25 +195,35 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
             for _ in range(local_epochs):
                 for xb, yb in client_loaders[uid]:
                     xb, yb = xb.to(device), yb.to(device)
+                    if uid in faulty_set and faulty_mode == "label_noise":
+                        yb = torch.randint(low=0, high=10, size=yb.shape, device=yb.device)
                     optimizer.zero_grad()
                     logits = model(xb)
                     loss = criterion(logits, yb)
                     loss.backward()
                     optimizer.step()
-            return torch_parameters_to_vector(model)
+            vec = torch_parameters_to_vector(model)
+            return apply_faulty_behavior(x_prev, vec, uid)
 
         # 初始全局参数（从随机初始化模型展开）
         x_prev = torch_parameters_to_vector(model_proto)
     else:
         # toy：使用之前的“朝向局部mu”的示例
         x_prev = np.zeros(dim_m, dtype=float)
-        make_grad_fn = make_grad_fn_factory(seed=seed)
+        base_grad_fn = make_grad_fn_factory(seed=seed)
+
+        def make_grad_fn(x_prev: np.ndarray, uid: int, round_t: int) -> np.ndarray:
+            vec = base_grad_fn(x_prev, uid, round_t)
+            return apply_faulty_behavior(x_prev, vec, uid)
 
     ta = TA.initialize(ff, dim_m, b_mode=b_mode)
     clients = [Client(uid=i, ff=ff, m=dim_m, ta=ta) for i in range(1, n_clients + 1)]
 
     for t in range(1, rounds + 1):
         print(f"\n=== Round {t} ===")
+        if faulty_set and t == 1:
+            extra = f", std={faulty_std}" if faulty_mode == "gaussian" else ""
+            print(f"  faulty clients={sorted(faulty_set)}, mode={faulty_mode}{extra}")
         # 本轮在线用户（模拟掉线）
         online_clients = [c for c in clients if not (offline_uid is not None and c.uid == offline_uid and t >= offline_from_round)]
         if len(online_clients) < t_thr:
@@ -323,10 +350,24 @@ def main():
     p.add_argument("--weight_rule", type=str, default="inverse_l2", choices=["inverse_l2","uniform"], help="client weight rule in truth discovery")
     p.add_argument("--log_weights", action="store_true", help="print per-round weight and aggregation diagnostics")
     p.add_argument("--log_local_eval", action="store_true", help="evaluate each client's local model on the test set (mnist only)")
+    p.add_argument("--faulty_uids", type=str, default="", help="comma separated client ids that behave unreliably")
+    p.add_argument(
+        "--faulty_mode",
+        type=str,
+        default="none",
+        choices=["none", "sign_flip", "gaussian", "label_noise"],
+        help="type of unreliable behavior to simulate",
+    )
+    p.add_argument("--faulty_std", type=float, default=0.5, help="stddev of Gaussian noise when faulty_mode=gaussian")
     args = p.parse_args()
 
     # 控制加权规则（truth_discovery 使用环境变量切换）
     os.environ["WEIGHT_RULE"] = args.weight_rule
+
+    if args.faulty_uids.strip():
+        faulty_uids = [int(tok) for tok in args.faulty_uids.split(',') if tok.strip()]
+    else:
+        faulty_uids = []
 
     simulate(
         rounds=args.rounds,
@@ -345,6 +386,9 @@ def main():
         auto_download=args.auto_download,
         log_weights=args.log_weights,
         log_local_eval=args.log_local_eval,
+        faulty_uids=faulty_uids,
+        faulty_mode=args.faulty_mode,
+        faulty_std=args.faulty_std,
     )
 
 

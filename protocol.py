@@ -66,7 +66,7 @@ class Client:
     def __post_init__(self):
         self.sk, self.pk = gen_x25519_kp()
 
-    def local_train_and_package(self, round_t: int, x_prev_float: np.ndarray, make_grad_fn, 
+    def local_train_and_package(self, round_t: int, x_prev_float: np.ndarray, make_grad_fn,
                                 n_online: int, t_thr: int, peer_pubkeys: Dict[int, bytes]) -> Dict:
         """
         Local computation 阶段（论文 5.2 Phase 2）：
@@ -75,7 +75,7 @@ class Client:
         """
         ff = self.ff
         # 1) 本地“梯度”向量（示例：由用户自定义 make_grad_fn 产生）
-        x_i = make_grad_fn(x_prev_float, self.uid)
+        x_i = make_grad_fn(x_prev_float, self.uid, round_t)
         self._last_local_vec = x_i.copy()
 
         # 2) 权重（默认用 “距离反比” 规则；可替换为 chi2_rule）
