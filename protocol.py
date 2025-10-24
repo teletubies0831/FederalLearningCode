@@ -76,9 +76,11 @@ class Client:
         ff = self.ff
         # 1) 本地“梯度”向量（示例：由用户自定义 make_grad_fn 产生）
         x_i = make_grad_fn(x_prev_float, self.uid)
+        self._last_local_vec = x_i.copy()
 
         # 2) 权重（默认用 “距离反比” 规则；可替换为 chi2_rule）
         w_i = weight_inverse_l2(x_i, x_prev_float, C=1.0)
+        self._last_weight = float(w_i)
 
         # 3) 编码到有限域
         x_prev = ff.encode_vec(x_prev_float)
@@ -208,7 +210,13 @@ class Server:
 
         return dict(Xagg=Xagg, Wagg=Wagg, V1_agg=V1_agg, V2_agg=V2_agg, R1=R1, R2=R2, n=len(user_msgs))
 
-def client_side_verify_and_update(ff: FixedField, ta: TA, agg_msg: Dict, b1_vec: np.ndarray, b2_sca: int) -> Tuple[bool, np.ndarray]:
+def client_side_verify_and_update(
+    ff: FixedField,
+    ta: TA,
+    agg_msg: Dict,
+    b1_vec: np.ndarray,
+    b2_sca: int,
+) -> Tuple[bool, np.ndarray, Dict[str, float]]:
     """
     Phase 4：客户端校验并更新（式(21)(22)(23)）
     - 校验通过：输出新一轮全局梯度 x^{T+1}（浮点）
@@ -226,7 +234,11 @@ def client_side_verify_and_update(ff: FixedField, ta: TA, agg_msg: Dict, b1_vec:
 
     ok = (np.all(left1 == right1) and (int(left2) % ff.q) == (int(right2) % ff.q))
     if not ok:
-        return False, None
+        return False, None, {
+            "weight_sum": float("nan"),
+            "numerator_l2": float("nan"),
+            "numerator_mean": float("nan"),
+        }
 
     # 通过则更新全局梯度（式(23)）：(Xagg - |U2|b1)/(Wagg - |U2|b2)
     # 为提高数值稳定性，这里采用：先解码再做实数除法，避免大模数下的奇异情况。
@@ -235,6 +247,15 @@ def client_side_verify_and_update(ff: FixedField, ta: TA, agg_msg: Dict, b1_vec:
     num = ff.decode_vec(num_enc)
     den = ff.decode_scalar(int(den_enc))
     if abs(den) < 1e-18:
-        return False, None
+        return False, None, {
+            "weight_sum": den,
+            "numerator_l2": float(np.linalg.norm(num)),
+            "numerator_mean": float(np.mean(num)),
+        }
     x_next = num / den
-    return True, x_next
+    diagnostics = {
+        "weight_sum": den,
+        "numerator_l2": float(np.linalg.norm(num)),
+        "numerator_mean": float(np.mean(num)),
+    }
+    return True, x_next, diagnostics

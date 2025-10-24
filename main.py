@@ -147,7 +147,8 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
              dataset: str = "toy", mnist_npz: str = "mnist.npz",
              offline_uid: int | None = None, offline_from_round: int = 10**9,
              lr: float = 0.1, local_epochs: int = 1, batch: int = 256,
-             b_mode: str = "per_round", auto_download: bool = True):
+             b_mode: str = "per_round", auto_download: bool = True,
+             log_weights: bool = False, log_local_eval: bool = False):
     assert 1 <= t_thr <= n_clients, "threshold t must satisfy 1 <= t <= n_clients"
 
     ff = FixedField()
@@ -255,7 +256,7 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
             b2_mean = (b2_sum * n_inv) % ff.q
 
         # Phase 4: 客户端侧验证并更新全局模型
-        ok, x_next = client_side_verify_and_update(ff, ta, agg_msg, b1_mean, b2_mean)
+        ok, x_next, agg_diag = client_side_verify_and_update(ff, ta, agg_msg, b1_mean, b2_mean)
         if not ok:
             raise RuntimeError("Verification failed: aggregated labels do not match.")
 
@@ -263,11 +264,35 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         print(f"online={len(online_clients)} / total={n_clients}, dim={dim_m}, thr={t_thr}")
         dx = x_next - x_prev
         print(f"x_prev[:4]={np.round(x_prev[:4], 6)} -> x_next[:4]={np.round(x_next[:4], 6)}  |  ||Δx||2={np.linalg.norm(dx):.3e}")
+        if log_weights:
+            weights = [getattr(c, "_last_weight", float("nan")) for c in online_clients]
+            if weights:
+                w_arr = np.array(weights, dtype=float)
+                print(
+                    "  weights stats: mean={:.4e}, min={:.4e}, max={:.4e}, sum={:.4e}".format(
+                        np.mean(w_arr), np.min(w_arr), np.max(w_arr), np.sum(w_arr)
+                    )
+                )
+            print(
+                "  aggregate diag: weight_sum={:.4e}, numerator_l2={:.4e}, numerator_mean={:.4e}".format(
+                    agg_diag["weight_sum"], agg_diag["numerator_l2"], agg_diag["numerator_mean"]
+                )
+            )
 
         # 评估（MNIST 测试集）
         if dataset == "mnist":
             test_loss, test_acc = evaluate_cnn_from_vector(x_next, test_loader, device)
             print(f"test: loss={test_loss:.4f}, acc={test_acc*100:.2f}%")
+            if log_local_eval:
+                for c in online_clients:
+                    local_vec = getattr(c, "_last_local_vec", None)
+                    if local_vec is None:
+                        continue
+                    loss_i, acc_i = evaluate_cnn_from_vector(local_vec, test_loader, device)
+                    weight_i = getattr(c, "_last_weight", float("nan"))
+                    print(
+                        f"    client {c.uid}: w={weight_i:.4e}, local loss={loss_i:.4f}, local acc={acc_i*100:.2f}%"
+                    )
         else:
             # toy 情况下没有标签，打印范数以辅助判断收敛
             print(f"toy: ||x||2={np.linalg.norm(x_next):.3e}")
@@ -296,6 +321,8 @@ def main():
     p.add_argument("--auto_download", dest="auto_download", action="store_true", default=True, help="(deprecated) kept for compatibility")
     p.add_argument("--no_auto_download", dest="auto_download", action="store_false", help="(deprecated) kept for compatibility")
     p.add_argument("--weight_rule", type=str, default="inverse_l2", choices=["inverse_l2","uniform"], help="client weight rule in truth discovery")
+    p.add_argument("--log_weights", action="store_true", help="print per-round weight and aggregation diagnostics")
+    p.add_argument("--log_local_eval", action="store_true", help="evaluate each client's local model on the test set (mnist only)")
     args = p.parse_args()
 
     # 控制加权规则（truth_discovery 使用环境变量切换）
@@ -316,6 +343,8 @@ def main():
         batch=args.batch,
         b_mode=args.b_mode,
         auto_download=args.auto_download,
+        log_weights=args.log_weights,
+        log_local_eval=args.log_local_eval,
     )
 
 
