@@ -86,7 +86,7 @@ class Client:
         w_i_enc = ff.encode_scalar(w_i)
 
         # 4) 计算加权梯度（标量*向量，在域上做乘法）
-        wix = (x_i_enc * w_i_enc) % ff.q  # wix^T_i
+        wix = ff.mul_weighted_vec(x_i_enc, w_i_enc)  # 修正缩放后的 w_i * x_i
 
         # 5) 第一层随机掩码 r1_i（向量）、r2_i（标量）
         r1_i = np.array([secrets.randbelow(ff.q) for _ in range(self.m)], dtype=object)

@@ -8,7 +8,8 @@
 from __future__ import annotations
 import os
 import numpy as np
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 # 选用一个很大的素数作为模（Mersenne 素数 2^127-1）
 Q = (1 << 127) - 1
@@ -17,11 +18,21 @@ Q = (1 << 127) - 1
 class FixedField:
     q: int = Q
     scale: int = 10**6  # 定点缩放系数：1e-6 精度
+    _scale_inv: int = field(init=False, repr=False)
+
+    def __post_init__(self):
+        """预计算缩放系数在有限域中的逆元，保持乘法缩放的一致性。"""
+        if math.gcd(self.scale, self.q) != 1:
+            raise ValueError("scale 必须与模 q 互素，以便存在乘法逆元")
+        self._scale_inv = pow(self.scale, self.q - 2, self.q)
 
     def encode_vec(self, x: np.ndarray) -> np.ndarray:
         """浮点向量→整数域（取整后 mod q）"""
-        xi = np.round(x * self.scale).astype(object)
-        return np.mod(xi, self.q)
+        ints = []
+        for v in np.ravel(x):
+            xi = int(round(float(v) * self.scale))
+            ints.append(xi % self.q)
+        return np.array(ints, dtype=object)
 
     def decode_vec(self, xi: np.ndarray) -> np.ndarray:
         """整数域→浮点向量"""
@@ -49,6 +60,24 @@ class FixedField:
 
     def mul(self, a, b):
         return (a * b) % self.q
+
+    def mul_weighted_vec(self, vec_enc: np.ndarray, scalar_enc: int) -> np.ndarray:
+        """在编码域中计算 (scalar * vec)，并修正缩放倍数。"""
+        # 先转换回“带符号整数”表示，再做整数乘法并除以 scale
+        vec_signed = np.array([self._to_signed(int(v)) for v in vec_enc], dtype=object)
+        scalar_signed = self._to_signed(int(scalar_enc))
+        prod = vec_signed * scalar_signed
+        half = self.scale // 2
+        # 四舍五入后再除以 scale，最后映射回有限域
+        adjusted = []
+        for val in prod:
+            v_int = int(val)
+            if v_int >= 0:
+                v_int = (v_int + half) // self.scale
+            else:
+                v_int = (v_int - half) // self.scale
+            adjusted.append(v_int % self.q)
+        return np.array(adjusted, dtype=object)
 
     def inv(self, x: int) -> int:
         """乘法逆元（费马小定理：x^(q-2) mod q）"""
