@@ -15,8 +15,10 @@
 """
 from __future__ import annotations
 import argparse
+import math
 import os
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import torch
 import torch.nn as nn
@@ -150,13 +152,32 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
              b_mode: str = "per_round", auto_download: bool = True,
              log_weights: bool = False, log_local_eval: bool = False,
              faulty_uids: list[int] | None = None, faulty_mode: str = "none",
-             faulty_std: float = 0.5):
+             faulty_std: float = 0.5, faulty_ratio: float = 0.0,
+             parallelism: int = 1):
     assert 1 <= t_thr <= n_clients, "threshold t must satisfy 1 <= t <= n_clients"
 
     ff = FixedField()
     faulty_uids = faulty_uids or []
     faulty_mode = (faulty_mode or "none").lower()
-    faulty_set = set(faulty_uids)
+    faulty_ratio = float(max(0.0, min(1.0, faulty_ratio)))
+    parallelism = max(1, int(parallelism))
+
+    base_faulty_set = set(int(uid) for uid in faulty_uids)
+    if faulty_ratio > 0.0:
+        rng_ratio = np.random.RandomState(seed + 54321)
+        target_count = min(
+            n_clients,
+            max(1, int(math.ceil(faulty_ratio * n_clients)))
+        )
+        if len(base_faulty_set) < target_count:
+            remaining = [uid for uid in range(1, n_clients + 1) if uid not in base_faulty_set]
+            need = target_count - len(base_faulty_set)
+            if need >= len(remaining):
+                base_faulty_set.update(remaining)
+            elif need > 0:
+                sampled = rng_ratio.choice(remaining, size=need, replace=False)
+                base_faulty_set.update(int(uid) for uid in sampled)
+    faulty_set = base_faulty_set
     faulty_rngs = {uid: np.random.RandomState(seed + 12345 + uid) for uid in faulty_set}
 
     def apply_faulty_behavior(x_prev_vec: np.ndarray, x_vec: np.ndarray, uid: int) -> np.ndarray:
@@ -177,7 +198,12 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         pass
 
     # 数据与模型维度
+    parallel_notice = None
+
     if dataset == "mnist":
+        if parallelism > 1:
+            parallel_notice = "MNIST uses PyTorch DataLoader; forcing sequential local training to avoid thread contention."
+            parallelism = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # 模型与维度
         model_proto = SimpleCNN().to(device)
@@ -223,7 +249,12 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         print(f"\n=== Round {t} ===")
         if faulty_set and t == 1:
             extra = f", std={faulty_std}" if faulty_mode == "gaussian" else ""
-            print(f"  faulty clients={sorted(faulty_set)}, mode={faulty_mode}{extra}")
+            ratio_info = f", ratio~{faulty_ratio:.3f}" if faulty_ratio > 0 else ""
+            print(f"  faulty clients={sorted(faulty_set)}, mode={faulty_mode}{extra}{ratio_info}")
+        if parallel_notice and t == 1:
+            print(f"  note: {parallel_notice}")
+        if parallelism > 1 and t == 1:
+            print(f"  parallelism={parallelism} (local training in thread pool)")
         # 本轮在线用户（模拟掉线）
         online_clients = [c for c in clients if not (offline_uid is not None and c.uid == offline_uid and t >= offline_from_round)]
         if len(online_clients) < t_thr:
@@ -236,9 +267,8 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         peer_pubkeys = {c.uid: c.pk for c in online_clients}
 
         # Phase 2: 客户端本地训练 + 打包密文载荷
-        user_msgs = []
-        for c in online_clients:
-            msg = c.local_train_and_package(
+        def _package_for_client(client: Client):
+            msg = client.local_train_and_package(
                 round_t=t,
                 x_prev_float=x_prev,
                 make_grad_fn=make_grad_fn,
@@ -246,7 +276,23 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
                 t_thr=t_thr,
                 peer_pubkeys=peer_pubkeys,
             )
-            user_msgs.append(msg)
+            return client.uid, msg
+
+        if parallelism > 1 and len(online_clients) > 1:
+            order_map = {c.uid: idx for idx, c in enumerate(online_clients)}
+            results: list[tuple[int, dict]] = []
+            with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                futures = [executor.submit(_package_for_client, c) for c in online_clients]
+                for fut in as_completed(futures):
+                    uid, msg = fut.result()
+                    results.append((uid, msg))
+            results.sort(key=lambda item: order_map[item[0]])
+            user_msgs = [msg for _, msg in results]
+        else:
+            user_msgs = []
+            for c in online_clients:
+                _, msg = _package_for_client(c)
+                user_msgs.append(msg)
 
         # 服务器转发对等方份额（每个用户收到“别人给自己”的密文份额）
         inbox = server.distribute_peer_shares(user_msgs)
@@ -359,6 +405,8 @@ def main():
         help="type of unreliable behavior to simulate",
     )
     p.add_argument("--faulty_std", type=float, default=0.5, help="stddev of Gaussian noise when faulty_mode=gaussian")
+    p.add_argument("--faulty_ratio", type=float, default=0.0, help="fraction of total clients to mark as faulty")
+    p.add_argument("--parallelism", type=int, default=1, help="number of threads for parallel client packaging")
     args = p.parse_args()
 
     # 控制加权规则（truth_discovery 使用环境变量切换）
@@ -389,6 +437,8 @@ def main():
         faulty_uids=faulty_uids,
         faulty_mode=args.faulty_mode,
         faulty_std=args.faulty_std,
+        faulty_ratio=args.faulty_ratio,
+        parallelism=args.parallelism,
     )
 
 
