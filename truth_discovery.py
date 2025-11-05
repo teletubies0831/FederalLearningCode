@@ -1,32 +1,71 @@
 # -*- coding: utf-8 -*-
-"""
-质量加权（真值发现范式）
-- 论文式(1)描述“权重与距离的反比”，式(6)给出一种 χ^2 基准的具体化。
-- 这里提供两种可选：'inverse_l2' 与 'chi2_rule'，默认 'inverse_l2' 更稳健。
-"""
+"""Truth discovery style client weighting rules."""
 from __future__ import annotations
+
 import os
+from typing import Callable, Dict
+
 import numpy as np
 
-def weight_inverse_l2(x_i: np.ndarray, x_prev: np.ndarray, C: float=1.0, eps: float=1e-8) -> float:
-    """
-    w_i = C / ( ||x_i - x_prev||^2 + eps )
-    - 与式(1)“C / F(·)”一致；eps 防止除零。
-    """
-    # 可选：通过环境变量切换为均匀权重
-    if os.environ.get("WEIGHT_RULE", "inverse_l2").lower() == "uniform":
-        return 1.0
-    dist2 = float(np.sum((x_i - x_prev)**2))
+
+def _inverse_l2_weight(x_i: np.ndarray, x_prev: np.ndarray, C: float = 1.0, eps: float = 1e-8) -> float:
+    """Inverse squared distance weighting (default in the paper)."""
+    dist2 = float(np.sum((x_i - x_prev) ** 2))
     return C / (dist2 + eps)
 
-def weight_chi2_rule(x_i: np.ndarray, x_prev: np.ndarray, alpha: float=0.05) -> float:
-    """
-    论文式(6)的 χ^2 思路：用阈值/分位函数把距离映射到权重（实现上用简单单调映射近似）
-    - 简化：w_i = Q / (||x_i - x_prev||^2 + eps)，其中 Q≈chi2_{1-alpha/2, m}
-    """
+
+def _uniform_weight(*_: np.ndarray) -> float:
+    """Baseline FedAvg style weighting (ESFL)."""
+
+    return 1.0
+
+
+def _chi2_weight(x_i: np.ndarray, x_prev: np.ndarray, alpha: float = 0.05) -> float:
+    """Simplified χ^2 mapping used for ablation studies in the original paper."""
+
     m = x_i.size
-    # 正态近似分位：Q ≈ m + z*sqrt(2m) （z≈1.96 对 95%）
-    z = 1.959963984540054
-    Q = m + z * (2*m)**0.5
-    dist2 = float(np.sum((x_i - x_prev)**2))
+    z = 1.959963984540054  # 95% quantile approximation
+    Q = m + z * (2 * m) ** 0.5
+    dist2 = float(np.sum((x_i - x_prev) ** 2))
     return Q / (dist2 + 1e-8)
+
+
+def _ppfdl_weight(x_i: np.ndarray, x_prev: np.ndarray, tau: float = 5.0, eps: float = 1e-8) -> float:
+    """
+    A smooth clipping rule inspired by PPFDL: the further a client drifts from the
+    previous global model, the more its contribution is attenuated but never fully
+    discarded. ``tau`` controls how aggressively unreliable updates are suppressed.
+    """
+
+    dist = float(np.linalg.norm(x_i - x_prev))
+    scaled = dist / max(tau, eps)
+    return 1.0 / (1.0 + scaled)
+
+
+_DISPATCH: Dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+    "inverse_l2": _inverse_l2_weight,
+    "uniform": _uniform_weight,
+    "esfl": _uniform_weight,
+    "chi2_rule": _chi2_weight,
+    "ppfdl": _ppfdl_weight,
+}
+
+
+def compute_weight(x_i: np.ndarray, x_prev: np.ndarray) -> float:
+    """Select and evaluate the weighting rule based on ``WEIGHT_RULE`` env var."""
+
+    rule = os.environ.get("WEIGHT_RULE", "inverse_l2").lower()
+    func = _DISPATCH.get(rule, _inverse_l2_weight)
+    return float(func(x_i, x_prev))
+
+
+def weight_inverse_l2(x_i: np.ndarray, x_prev: np.ndarray, C: float = 1.0, eps: float = 1e-8) -> float:
+    """Backward compatibility shim for existing imports."""
+
+    return _inverse_l2_weight(x_i, x_prev, C=C, eps=eps)
+
+
+def weight_chi2_rule(x_i: np.ndarray, x_prev: np.ndarray, alpha: float = 0.05) -> float:
+    """Backward compatibility shim returning χ^2-style weights."""
+
+    return _chi2_weight(x_i, x_prev, alpha=alpha)

@@ -2,3 +2,4 @@ numpy
 cryptography
 torch
 torchvision
+matplotlib

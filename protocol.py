@@ -22,7 +22,7 @@ from crypto_primitives import (
     gen_x25519_kp, ecdh_shared_key, aead_encrypt, aead_decrypt,
     prg_b1_b2, prg_b1_b2_round,
 )
-from truth_discovery import weight_inverse_l2
+from truth_discovery import compute_weight
 from utils import hadamard, pack_vec_and_scalar, unpack_vec_and_scalar
 
 # ===== 实体定义 =====
@@ -79,7 +79,7 @@ class Client:
         self._last_local_vec = x_i.copy()
 
         # 2) 权重（默认用 “距离反比” 规则；可替换为 chi2_rule）
-        w_i = weight_inverse_l2(x_i, x_prev_float, C=1.0)
+        w_i = compute_weight(x_i, x_prev_float)
         self._last_weight = float(w_i)
 
         # 3) 编码到有限域

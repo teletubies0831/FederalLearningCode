@@ -19,16 +19,21 @@ import math
 import os
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 from field import FixedField
 from protocol import TA, Client, Server, client_side_verify_and_update
 from crypto_primitives import prg_b1_b2
+from low_quality import LowQualityPolicy
 
 
 # ====== MNIST 相关（PyTorch CNN 版）======
@@ -50,6 +55,34 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)
         return x
 
+
+class SimpleCIFAR10CNN(nn.Module):
+    """轻量版 CNN，用于 CIFAR-10。"""
+
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 10),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        return self.classifier(x)
+
+
 def torch_parameters_to_vector(model: nn.Module) -> np.ndarray:
     with torch.no_grad():
         vec = torch.cat([p.view(-1) for p in model.parameters()])
@@ -63,8 +96,11 @@ def torch_vector_to_parameters(model: nn.Module, vec: np.ndarray):
             numel = p.numel()
             p.copy_(t[pointer:pointer+numel].to(p.device).view_as(p))
             pointer += numel
-def evaluate_cnn_from_vector(vec: np.ndarray, test_loader: DataLoader, device: str) -> tuple[float, float]:
-    model = SimpleCNN().to(device)
+
+
+def evaluate_model_from_vector(model_cls: Callable[[], nn.Module], vec: np.ndarray,
+                               test_loader: DataLoader, device: str) -> tuple[float, float]:
+    model = model_cls().to(device)
     torch_vector_to_parameters(model, vec)
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction='sum')
@@ -81,6 +117,14 @@ def evaluate_cnn_from_vector(vec: np.ndarray, test_loader: DataLoader, device: s
             correct += int((pred == yb).sum().item())
             total += yb.size(0)
     return loss_sum / max(1, total), (correct / max(1, total))
+
+
+def evaluate_cnn_from_vector(vec: np.ndarray, test_loader: DataLoader, device: str) -> tuple[float, float]:
+    return evaluate_model_from_vector(SimpleCNN, vec, test_loader, device)
+
+
+def evaluate_cifar10_from_vector(vec: np.ndarray, test_loader: DataLoader, device: str) -> tuple[float, float]:
+    return evaluate_model_from_vector(SimpleCIFAR10CNN, vec, test_loader, device)
 
 def local_train_softmax(x_prev: np.ndarray, X: np.ndarray, y: np.ndarray, d: int, k: int,
                         lr: float = 0.1, epochs: int = 1, batch: int = 256, l2: float = 0.0) -> np.ndarray:
@@ -126,6 +170,85 @@ def build_mnist_loaders(n_clients: int, batch: int, data_root: str = "./data"):
     return client_loaders, test_loader
 
 
+class ClientCIFAR10Dataset(Dataset):
+    """CIFAR-10 划分后的子数据集，支持低质量策略。"""
+
+    def __init__(
+        self,
+        base_dataset: datasets.CIFAR10,
+        indices: Iterable[int],
+        transform: Optional[transforms.Compose],
+        policy: Optional[LowQualityPolicy] = None,
+        seed: int = 0,
+    ) -> None:
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+        self.transform = transform
+        self.policy = policy.spawn(seed) if policy else None
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        image, label = self.base_dataset[self.indices[idx]]
+        if self.policy is not None:
+            image, label = self.policy.apply(image, label)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
+
+def build_cifar10_loaders(
+    n_clients: int,
+    batch: int,
+    data_root: str = "./data",
+    seed: int = 0,
+    samples_per_client: Optional[int] = None,
+    low_quality_policies: Optional[Dict[int, LowQualityPolicy]] = None,
+):
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    try:
+        base_train = datasets.CIFAR10(root=data_root, train=True, download=True, transform=None)
+        test_ds = datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform_test)
+    except Exception as e:
+        print(f"TorchVision download failed: {e}\n请确认网络可用，或手动准备 CIFAR-10 到 {data_root}。")
+        raise
+
+    idxs = np.arange(len(base_train))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(idxs)
+
+    if samples_per_client is not None:
+        total = min(len(idxs), int(samples_per_client) * n_clients)
+        idxs = idxs[:total]
+
+    splits = np.array_split(idxs, n_clients)
+    client_loaders: Dict[int, DataLoader] = {}
+    for i, arr in enumerate(splits, start=1):
+        policy = None
+        if low_quality_policies and i in low_quality_policies:
+            policy = low_quality_policies[i]
+        subset = ClientCIFAR10Dataset(
+            base_train,
+            arr.tolist(),
+            transform_train,
+            policy=policy,
+            seed=seed + 97 * i,
+        )
+        client_loaders[i] = DataLoader(subset, batch_size=batch, shuffle=True, num_workers=0)
+
+    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0)
+    return client_loaders, test_loader
+
+
 def make_grad_fn_factory(seed: int = 0, lr: float = 0.5):
     rng = np.random.RandomState(seed)
 
@@ -145,16 +268,40 @@ def make_grad_fn_factory(seed: int = 0, lr: float = 0.5):
     return make_grad_fn
 
 
-def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3, seed: int = 0,
-             dataset: str = "toy", mnist_npz: str = "mnist.npz",
-             offline_uid: int | None = None, offline_from_round: int = 10**9,
-             lr: float = 0.1, local_epochs: int = 1, batch: int = 256,
-             b_mode: str = "per_round", auto_download: bool = True,
-             log_weights: bool = False, log_local_eval: bool = False,
-             faulty_uids: list[int] | None = None, faulty_mode: str = "none",
-             faulty_std: float = 0.5, faulty_ratio: float = 0.0,
-             parallelism: int = 1):
+def simulate(
+    rounds: int = 3,
+    n_clients: int = 5,
+    dim_m: int = 8,
+    t_thr: int = 3,
+    seed: int = 0,
+    dataset: str = "toy",
+    mnist_npz: str = "mnist.npz",
+    offline_uid: int | None = None,
+    offline_from_round: int = 10**9,
+    lr: float = 0.1,
+    local_epochs: int = 1,
+    batch: int = 256,
+    b_mode: str = "per_round",
+    auto_download: bool = True,
+    log_weights: bool = False,
+    log_local_eval: bool = False,
+    faulty_uids: list[int] | None = None,
+    faulty_mode: str = "none",
+    faulty_std: float = 0.5,
+    faulty_ratio: float = 0.0,
+    parallelism: int = 1,
+    method: str = "ours",
+    data_root: str = "./data",
+    low_quality_family: str | None = None,
+    low_quality_severity: float = 0.3,
+    cifar_samples_per_client: Optional[int] = None,
+    verbose: bool = True,
+):
     assert 1 <= t_thr <= n_clients, "threshold t must satisfy 1 <= t <= n_clients"
+
+    method_name = (method or "ours").lower()
+    weight_rule_map = {"ours": "inverse_l2", "esfl": "uniform", "ppfdl": "ppfdl"}
+    os.environ["WEIGHT_RULE"] = weight_rule_map.get(method_name, method_name)
 
     ff = FixedField()
     faulty_uids = faulty_uids or []
@@ -165,10 +312,7 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
     base_faulty_set = set(int(uid) for uid in faulty_uids)
     if faulty_ratio > 0.0:
         rng_ratio = np.random.RandomState(seed + 54321)
-        target_count = min(
-            n_clients,
-            max(1, int(math.ceil(faulty_ratio * n_clients)))
-        )
+        target_count = min(n_clients, max(1, int(math.ceil(faulty_ratio * n_clients))))
         if len(base_faulty_set) < target_count:
             remaining = [uid for uid in range(1, n_clients + 1) if uid not in base_faulty_set]
             need = target_count - len(base_faulty_set)
@@ -188,33 +332,36 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
         if faulty_mode == "gaussian":
             noise = faulty_rngs[uid].normal(loc=0.0, scale=faulty_std, size=x_prev_vec.shape)
             return x_prev_vec + noise
-        # label_noise 或未知模式直接返回（label_noise 在训练时处理）
         return x_vec
-    # Reproducibility (best-effort)
+
     np.random.seed(seed)
     try:
         torch.manual_seed(seed)
     except Exception:
         pass
 
-    # 数据与模型维度
     parallel_notice = None
+    evaluation_fn: Optional[Callable[[np.ndarray], Tuple[float, float]]] = None
+    model_class: Optional[Callable[[], nn.Module]] = None
+    device = "cpu"
+    metrics_history: List[Dict[str, float]] = []
+    final_test_loss: Optional[float] = None
+    final_test_acc: Optional[float] = None
+    test_loader: Optional[DataLoader] = None
 
     if dataset == "mnist":
         if parallelism > 1:
             parallel_notice = "MNIST uses PyTorch DataLoader; forcing sequential local training to avoid thread contention."
             parallelism = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # 模型与维度
-        model_proto = SimpleCNN().to(device)
+        model_class = SimpleCNN
+        model_proto = model_class().to(device)
         dim_m = int(sum(p.numel() for p in model_proto.parameters()))
-        # 数据加载与客户端划分
-        client_loaders, test_loader = build_mnist_loaders(n_clients, batch)
+        client_loaders, test_loader = build_mnist_loaders(n_clients, batch, data_root=data_root)
 
-        # 本地训练函数：从向量加载模型，训练若干 epoch，返回更新后的参数向量
-        def make_grad_fn(x_prev: np.ndarray, uid: int, round_t: int) -> np.ndarray:
-            model = SimpleCNN().to(device)
-            torch_vector_to_parameters(model, x_prev)
+        def make_grad_fn(x_prev_vec: np.ndarray, uid: int, round_t: int) -> np.ndarray:
+            model = model_class().to(device)
+            torch_vector_to_parameters(model, x_prev_vec)
             model.train()
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
@@ -229,32 +376,79 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
                     loss.backward()
                     optimizer.step()
             vec = torch_parameters_to_vector(model)
-            return apply_faulty_behavior(x_prev, vec, uid)
+            return apply_faulty_behavior(x_prev_vec, vec, uid)
 
-        # 初始全局参数（从随机初始化模型展开）
         x_prev = torch_parameters_to_vector(model_proto)
+        evaluation_fn = lambda vec, _loader=test_loader, _device=device: evaluate_model_from_vector(model_class, vec, _loader, _device)
+    elif dataset == "cifar10":
+        if parallelism > 1:
+            parallel_notice = "CIFAR-10 uses PyTorch DataLoader; forcing sequential local training to avoid thread contention."
+            parallelism = 1
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_class = SimpleCIFAR10CNN
+        model_proto = model_class().to(device)
+        dim_m = int(sum(p.numel() for p in model_proto.parameters()))
+        policies = None
+        if faulty_set and low_quality_family:
+            base_policy = LowQualityPolicy(
+                family=low_quality_family,
+                severity=low_quality_severity,
+                num_classes=10,
+                seed=seed,
+            )
+            policies = {uid: base_policy.spawn(seed + 789 * uid) for uid in faulty_set}
+        client_loaders, test_loader = build_cifar10_loaders(
+            n_clients,
+            batch,
+            data_root=data_root,
+            seed=seed,
+            samples_per_client=cifar_samples_per_client,
+            low_quality_policies=policies,
+        )
+
+        def make_grad_fn(x_prev_vec: np.ndarray, uid: int, round_t: int) -> np.ndarray:
+            model = model_class().to(device)
+            torch_vector_to_parameters(model, x_prev_vec)
+            model.train()
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+            for _ in range(local_epochs):
+                for xb, yb in client_loaders[uid]:
+                    xb, yb = xb.to(device), yb.to(device)
+                    if uid in faulty_set and faulty_mode == "label_noise":
+                        yb = torch.randint(low=0, high=10, size=yb.shape, device=yb.device)
+                    optimizer.zero_grad()
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+                    loss.backward()
+                    optimizer.step()
+            vec = torch_parameters_to_vector(model)
+            return apply_faulty_behavior(x_prev_vec, vec, uid)
+
+        x_prev = torch_parameters_to_vector(model_proto)
+        evaluation_fn = lambda vec, _loader=test_loader, _device=device: evaluate_model_from_vector(model_class, vec, _loader, _device)
     else:
-        # toy：使用之前的“朝向局部mu”的示例
         x_prev = np.zeros(dim_m, dtype=float)
         base_grad_fn = make_grad_fn_factory(seed=seed)
 
-        def make_grad_fn(x_prev: np.ndarray, uid: int, round_t: int) -> np.ndarray:
-            vec = base_grad_fn(x_prev, uid, round_t)
-            return apply_faulty_behavior(x_prev, vec, uid)
+        def make_grad_fn(x_prev_vec: np.ndarray, uid: int, round_t: int) -> np.ndarray:
+            vec = base_grad_fn(x_prev_vec, uid, round_t)
+            return apply_faulty_behavior(x_prev_vec, vec, uid)
 
     ta = TA.initialize(ff, dim_m, b_mode=b_mode)
     clients = [Client(uid=i, ff=ff, m=dim_m, ta=ta) for i in range(1, n_clients + 1)]
 
     for t in range(1, rounds + 1):
-        print(f"\n=== Round {t} ===")
-        if faulty_set and t == 1:
-            extra = f", std={faulty_std}" if faulty_mode == "gaussian" else ""
-            ratio_info = f", ratio~{faulty_ratio:.3f}" if faulty_ratio > 0 else ""
-            print(f"  faulty clients={sorted(faulty_set)}, mode={faulty_mode}{extra}{ratio_info}")
-        if parallel_notice and t == 1:
-            print(f"  note: {parallel_notice}")
-        if parallelism > 1 and t == 1:
-            print(f"  parallelism={parallelism} (local training in thread pool)")
+        if verbose:
+            print(f"\n=== Round {t} ===")
+            if faulty_set and t == 1:
+                extra = f", std={faulty_std}" if faulty_mode == "gaussian" else ""
+                ratio_info = f", ratio~{faulty_ratio:.3f}" if faulty_ratio > 0 else ""
+                print(f"  faulty clients={sorted(faulty_set)}, mode={faulty_mode}{extra}{ratio_info}")
+            if parallel_notice and t == 1:
+                print(f"  note: {parallel_notice}")
+            if parallelism > 1 and t == 1:
+                print(f"  parallelism={parallelism} (local training in thread pool)")
         # 本轮在线用户（模拟掉线）
         online_clients = [c for c in clients if not (offline_uid is not None and c.uid == offline_uid and t >= offline_from_round)]
         if len(online_clients) < t_thr:
@@ -334,10 +528,13 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
             raise RuntimeError("Verification failed: aggregated labels do not match.")
 
         # 打印本轮信息
-        print(f"online={len(online_clients)} / total={n_clients}, dim={dim_m}, thr={t_thr}")
-        dx = x_next - x_prev
-        print(f"x_prev[:4]={np.round(x_prev[:4], 6)} -> x_next[:4]={np.round(x_next[:4], 6)}  |  ||Δx||2={np.linalg.norm(dx):.3e}")
-        if log_weights:
+        if verbose:
+            print(f"online={len(online_clients)} / total={n_clients}, dim={dim_m}, thr={t_thr}")
+            dx = x_next - x_prev
+            print(
+                f"x_prev[:4]={np.round(x_prev[:4], 6)} -> x_next[:4]={np.round(x_next[:4], 6)}  |  ||Δx||2={np.linalg.norm(dx):.3e}"
+            )
+        if log_weights and verbose:
             weights = [getattr(c, "_last_weight", float("nan")) for c in online_clients]
             if weights:
                 w_arr = np.array(weights, dtype=float)
@@ -353,27 +550,44 @@ def simulate(rounds: int = 3, n_clients: int = 5, dim_m: int = 8, t_thr: int = 3
             )
 
         # 评估（MNIST 测试集）
-        if dataset == "mnist":
-            test_loss, test_acc = evaluate_cnn_from_vector(x_next, test_loader, device)
-            print(f"test: loss={test_loss:.4f}, acc={test_acc*100:.2f}%")
-            if log_local_eval:
+        if evaluation_fn is not None:
+            test_loss, test_acc = evaluation_fn(x_next)
+            final_test_loss, final_test_acc = test_loss, test_acc
+            metrics_history.append({"round": t, "test_loss": test_loss, "test_acc": test_acc})
+            if verbose:
+                print(f"test: loss={test_loss:.4f}, acc={test_acc*100:.2f}%")
+            if log_local_eval and verbose and model_class is not None and test_loader is not None:
                 for c in online_clients:
                     local_vec = getattr(c, "_last_local_vec", None)
                     if local_vec is None:
                         continue
-                    loss_i, acc_i = evaluate_cnn_from_vector(local_vec, test_loader, device)
+                    loss_i, acc_i = evaluate_model_from_vector(model_class, local_vec, test_loader, device)
                     weight_i = getattr(c, "_last_weight", float("nan"))
                     print(
                         f"    client {c.uid}: w={weight_i:.4e}, local loss={loss_i:.4f}, local acc={acc_i*100:.2f}%"
                     )
         else:
-            # toy 情况下没有标签，打印范数以辅助判断收敛
-            print(f"toy: ||x||2={np.linalg.norm(x_next):.3e}")
+            toy_norm = float(np.linalg.norm(x_next))
+            metrics_history.append({"round": t, "l2_norm": toy_norm})
+            if verbose:
+                print(f"toy: ||x||2={toy_norm:.3e}")
 
         x_prev = x_next
 
-    print("\nTraining finished.")
-    print("x_final (first 8 dims):", np.round(x_prev[:8], 6))
+    if verbose:
+        print("\nTraining finished.")
+        preview = np.round(x_prev[: min(8, x_prev.size)], 6)
+        print("x_final (first 8 dims):", preview)
+
+    return {
+        "final_vector": x_prev.copy(),
+        "round_metrics": metrics_history,
+        "final_test_loss": final_test_loss,
+        "final_test_acc": final_test_acc,
+        "faulty_clients": sorted(faulty_set),
+        "method": method_name,
+        "dataset": dataset,
+    }
 
 
 def main():
@@ -383,7 +597,7 @@ def main():
     p.add_argument("--thr", type=int, default=3, help="Shamir threshold t")
     p.add_argument("--rounds", type=int, default=3, help="training rounds")
     p.add_argument("--seed", type=int, default=0, help="random seed for toy data")
-    p.add_argument("--dataset", type=str, default="toy", choices=["toy", "mnist"], help="dataset/mode")
+    p.add_argument("--dataset", type=str, default="toy", choices=["toy", "mnist", "cifar10"], help="dataset/mode")
     p.add_argument("--mnist_npz", type=str, default="mnist.npz", help="(deprecated) legacy npz path, unused in torch mode")
     p.add_argument("--offline_uid", type=int, default=None, help="a client id to drop (simulate offline)")
     p.add_argument("--offline_from_round", type=int, default=10**9, help="start round for the offline client")
@@ -393,7 +607,7 @@ def main():
     p.add_argument("--b_mode", type=str, default="per_round", choices=["per_round", "per_user"], help="2nd-layer mask mode (paper usually per_round)")
     p.add_argument("--auto_download", dest="auto_download", action="store_true", default=True, help="(deprecated) kept for compatibility")
     p.add_argument("--no_auto_download", dest="auto_download", action="store_false", help="(deprecated) kept for compatibility")
-    p.add_argument("--weight_rule", type=str, default="inverse_l2", choices=["inverse_l2","uniform"], help="client weight rule in truth discovery")
+    p.add_argument("--method", type=str, default="ours", choices=["ours", "esfl", "ppfdl", "uniform", "inverse_l2", "chi2_rule"], help="aggregation strategy / baseline")
     p.add_argument("--log_weights", action="store_true", help="print per-round weight and aggregation diagnostics")
     p.add_argument("--log_local_eval", action="store_true", help="evaluate each client's local model on the test set (mnist only)")
     p.add_argument("--faulty_uids", type=str, default="", help="comma separated client ids that behave unreliably")
@@ -407,17 +621,20 @@ def main():
     p.add_argument("--faulty_std", type=float, default=0.5, help="stddev of Gaussian noise when faulty_mode=gaussian")
     p.add_argument("--faulty_ratio", type=float, default=0.0, help="fraction of total clients to mark as faulty")
     p.add_argument("--parallelism", type=int, default=1, help="number of threads for parallel client packaging")
+    p.add_argument("--data_root", type=str, default="./data", help="root directory for torchvision datasets")
+    p.add_argument("--samples_per_client", type=int, default=None, help="cap the number of training samples per client (cifar10)")
+    p.add_argument("--low_quality_family", type=str, default="symmetric", choices=["symmetric", "class_dependent", "robust", "erasing", "symmetric_noise"], help="low-quality data family for faulty clients (cifar10)")
+    p.add_argument("--low_quality_severity", type=float, default=0.3, help="severity for low-quality data manipulation")
+    p.add_argument("--silent", action="store_true", help="suppress verbose console output")
+    p.add_argument("--save_metrics", type=str, default=None, help="optional path to dump metrics as JSON")
     args = p.parse_args()
-
-    # 控制加权规则（truth_discovery 使用环境变量切换）
-    os.environ["WEIGHT_RULE"] = args.weight_rule
 
     if args.faulty_uids.strip():
         faulty_uids = [int(tok) for tok in args.faulty_uids.split(',') if tok.strip()]
     else:
         faulty_uids = []
 
-    simulate(
+    result = simulate(
         rounds=args.rounds,
         n_clients=args.clients,
         dim_m=args.dim,
@@ -439,7 +656,25 @@ def main():
         faulty_std=args.faulty_std,
         faulty_ratio=args.faulty_ratio,
         parallelism=args.parallelism,
+        method=args.method,
+        data_root=args.data_root,
+        low_quality_family=args.low_quality_family,
+        low_quality_severity=args.low_quality_severity,
+        cifar_samples_per_client=args.samples_per_client,
+        verbose=not args.silent,
     )
+
+    if args.save_metrics:
+        path = Path(args.save_metrics)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serializable = dict(result)
+        final_vec = serializable.get("final_vector")
+        if isinstance(final_vec, np.ndarray):
+            serializable["final_vector"] = final_vec.astype(float).tolist()
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2, ensure_ascii=False)
+        if not args.silent:
+            print(f"metrics saved to {path}")
 
 
 if __name__ == "__main__":

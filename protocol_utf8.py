@@ -22,7 +22,7 @@ from crypto_primitives import (
     gen_x25519_kp, ecdh_shared_key, aead_encrypt, aead_decrypt,
     prg_b1_b2, prg_b1_b2_round,
 )
-from truth_discovery import weight_inverse_l2
+from truth_discovery import compute_weight
 from utils import hadamard, pack_vec_and_scalar, unpack_vec_and_scalar
 
 # ===== 瀹炰綋瀹氫箟 =====
@@ -75,7 +75,7 @@ class Client:
         x_i = make_grad_fn(x_prev_float, self.uid)
 
         # 2) 鏉冮噸锛堥粯璁ょ敤 鈥滆窛绂诲弽姣斺€?瑙勫垯锛涘彲鏇挎崲涓?chi2_rule锛?
-        w_i = weight_inverse_l2(x_i, x_prev_float, C=1.0)
+        w_i = compute_weight(x_i, x_prev_float)
 
         # 3) 缂栫爜鍒版湁闄愬煙
         x_prev = ff.encode_vec(x_prev_float)
