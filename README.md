@@ -77,8 +77,11 @@ python run_experiment.py \
 | `--pixel-dropout` | 像素随机置零的概率 |
 | `--seed` | 随机种子，确保可复现 |
 
-> **说明**：`--low-quality-fraction` 按客户端层面计算比例。例如 `--num-clients 20 --low-quality-fraction 0.3` 会随机挑选 6 个客户端，
-> 这些客户端在整个训练过程中始终使用退化后的数据集，从而模拟论文中的低质量参与方。
+> **说明 1**：当 `dropout_rate` 产生的候选掉线客户端数量大于 `dropout_tolerance` 时，代码会自动裁剪掉线集合，仅保留 `dropout_tolerance`
+> 个客户端真正掉线，以符合协议中的容错约束。若希望模拟更多掉线，请同步增大 `dropout_tolerance`。
+>
+> **说明 2**：`--low-quality-fraction` 按客户端层面计算比例。例如 `--num-clients 20 --low-quality-fraction 0.3` 会随机挑选 6 个客户端，这些
+> 客户端在整个训练过程中始终使用退化后的数据集，从而模拟论文中的低质量参与方。
 
 ## 结果输出
 

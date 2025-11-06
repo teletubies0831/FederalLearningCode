@@ -92,8 +92,26 @@ class FederatedTrainer:
 
         generator = torch.Generator().manual_seed(round_idx)
         dropout_mask = torch.rand(len(self.client_loaders), generator=generator)
-        for client_id, (loader, mask_prob) in enumerate(zip(self.client_loaders, dropout_mask.tolist())):
-            if mask_prob < dropout_rate:
+
+        # 先根据 ``dropout_rate`` 预选掉线候选客户端，再根据 ``dropout_tolerance``
+        # 控制实际掉线数量不超过协议允许的范围。这样可以解释用户在问题中遇到的现象：
+        # 当随机掉线客户端数量超过 ``dropout_tolerance`` 时，之前的实现会直接报错。
+        tentative_dropouts = [
+            client_id
+            for client_id, mask_prob in enumerate(dropout_mask.tolist())
+            if mask_prob < dropout_rate
+        ]
+        if len(tentative_dropouts) > self.dropout_tolerance:
+            # 使用与 ``dropout_mask`` 相同的随机源，保证实验可复现。
+            selection_order = torch.randperm(len(tentative_dropouts), generator=generator).tolist()
+            allowed_dropouts = {
+                tentative_dropouts[idx] for idx in selection_order[: self.dropout_tolerance]
+            }
+        else:
+            allowed_dropouts = set(tentative_dropouts)
+
+        for client_id, loader in enumerate(self.client_loaders):
+            if client_id in allowed_dropouts:
                 continue
 
             client_model = self.model_builder().to(self.device)
