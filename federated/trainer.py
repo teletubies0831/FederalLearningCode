@@ -1,13 +1,15 @@
-"""Federated averaging training loop with detailed logging."""
+"""Federated training with secure aggregation, dropout tolerance, and truth discovery."""
 from __future__ import annotations
 
-import random
+import hashlib
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Tuple
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
+from .aggregation import ClientReport, SecureAggregationController
 
 
 @dataclass
@@ -19,8 +21,8 @@ class TrainingHistory:
     test_accuracy: float
 
 
-class FedAvgTrainer:
-    """Lightweight implementation of the FedAvg algorithm."""
+class FederatedTrainer:
+    """Secure federated learning trainer that follows the thesis protocol."""
 
     def __init__(
         self,
@@ -30,8 +32,8 @@ class FedAvgTrainer:
         device: torch.device,
         lr: float,
         local_epochs: int,
+        dropout_tolerance: int,
         weight_decay: float = 0.0,
-        seed: int = 42,
     ) -> None:
         self.model_builder = model_builder
         self.client_loaders = client_loaders
@@ -39,65 +41,89 @@ class FedAvgTrainer:
         self.device = device
         self.lr = lr
         self.local_epochs = local_epochs
+        self.dropout_tolerance = dropout_tolerance
         self.weight_decay = weight_decay
-        self.rng = random.Random(seed)
 
-    def train(self, num_rounds: int, clients_per_round: int) -> Tuple[nn.Module, List[TrainingHistory]]:
-        """Run the federated training loop."""
+    def train(
+        self,
+        num_rounds: int,
+        dropout_rate: float,
+    ) -> Tuple[nn.Module, List[TrainingHistory]]:
+        """Run the federated training loop using secure aggregation."""
+
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in [0.0, 1.0)")
 
         global_model = self.model_builder().to(self.device)
         history: List[TrainingHistory] = []
+        num_clients = len(self.client_loaders)
+        aggregator = SecureAggregationController(num_clients=num_clients, dropout_tolerance=self.dropout_tolerance)
 
         for round_idx in range(1, num_rounds + 1):
-            # 在每一轮随机抽取部分客户端参与训练
-            selected_indices = self._sample_clients(clients_per_round)
-            # 聚合客户端更新，返回新的全局模型参数
-            aggregated_state = self._aggregate_client_updates(global_model, selected_indices)
+            global_state = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
+            client_reports = list(
+                self._collect_client_reports(
+                    round_idx=round_idx,
+                    global_state=global_state,
+                    dropout_rate=dropout_rate,
+                )
+            )
+
+            aggregated_state = aggregator.aggregate(global_state, client_reports)
             global_model.load_state_dict(aggregated_state)
 
             test_loss, test_acc = self.evaluate(global_model)
             history.append(TrainingHistory(round=round_idx, test_loss=test_loss, test_accuracy=test_acc))
+            active_clients = sorted(report.client_id for report in client_reports)
             print(
-                f"Round {round_idx:03d}/{num_rounds:03d} | Selected clients: {selected_indices} | "
+                f"Round {round_idx:03d}/{num_rounds:03d} | Active clients: {active_clients} | "
                 f"Test loss: {test_loss:.4f} | Test acc: {test_acc:.4f}"
             )
 
         return global_model, history
 
-    def _sample_clients(self, clients_per_round: int) -> List[int]:
-        if clients_per_round <= 0 or clients_per_round > len(self.client_loaders):
-            raise ValueError("clients_per_round must be in [1, num_clients]")
-        return self.rng.sample(range(len(self.client_loaders)), clients_per_round)
+    def _collect_client_reports(
+        self,
+        round_idx: int,
+        global_state: Dict[str, torch.Tensor],
+        dropout_rate: float,
+    ) -> Iterable[ClientReport]:
+        """Train every client sequentially and emit secure reports."""
 
-    def _aggregate_client_updates(self, global_model: nn.Module, client_indices: Iterable[int]) -> Dict[str, torch.Tensor]:
-        """Train each sampled client and average their resulting models."""
+        generator = torch.Generator().manual_seed(round_idx)
+        dropout_mask = torch.rand(len(self.client_loaders), generator=generator)
+        for client_id, (loader, mask_prob) in enumerate(zip(self.client_loaders, dropout_mask.tolist())):
+            if mask_prob < dropout_rate:
+                continue
 
-        global_state = global_model.state_dict()
-        # 以全局模型参数形状初始化累积容器
-        aggregated_state = {key: torch.zeros_like(param) for key, param in global_state.items()}
-        num_clients = 0
-
-        for client_idx in client_indices:
             client_model = self.model_builder().to(self.device)
-            client_model.load_state_dict(global_state)
-            self._train_single_client(client_model, self.client_loaders[client_idx])
+            client_model.load_state_dict({k: v.clone().to(self.device) for k, v in global_state.items()})
+            training_loss = self._train_single_client(client_model, loader)
             client_state = {k: v.detach().cpu() for k, v in client_model.state_dict().items()}
-            for key, value in client_state.items():
-                aggregated_state[key] += value
-            num_clients += 1
+            commitment = self._commit_state(client_state)
+            yield ClientReport(
+                client_id=client_id,
+                updated_state=client_state,
+                training_loss=training_loss,
+                commitment=commitment,
+            )
 
-        if num_clients == 0:
-            raise RuntimeError("No clients were aggregated during this round")
+    def _commit_state(self, state: Dict[str, torch.Tensor]) -> str:
+        """Compute a SHA256 commitment for ``state``."""
 
-        for key in aggregated_state:
-            aggregated_state[key] /= float(num_clients)
+        hasher = hashlib.sha256()
+        for key in sorted(state.keys()):
+            tensor_bytes = state[key].contiguous().numpy().tobytes()
+            hasher.update(key.encode("utf-8"))
+            hasher.update(tensor_bytes)
+        return hasher.hexdigest()
 
-        return aggregated_state
-
-    def _train_single_client(self, model: nn.Module, loader: DataLoader) -> None:
+    def _train_single_client(self, model: nn.Module, loader: DataLoader) -> float:
         model.train()
         optimizer = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         loss_fn = nn.CrossEntropyLoss()
+        cumulative_loss = 0.0
+        num_batches = 0
 
         for _ in range(self.local_epochs):
             for images, targets in loader:
@@ -108,6 +134,10 @@ class FedAvgTrainer:
                 loss = loss_fn(logits, targets)
                 loss.backward()
                 optimizer.step()
+                cumulative_loss += loss.item()
+                num_batches += 1
+
+        return cumulative_loss / max(num_batches, 1)
 
     def evaluate(self, model: nn.Module) -> Tuple[float, float]:
         """Evaluate ``model`` on the shared test set."""

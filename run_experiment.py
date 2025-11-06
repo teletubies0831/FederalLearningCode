@@ -5,12 +5,11 @@ import argparse
 import random
 from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 
 from federated.data import create_data_loaders
 from federated.models import get_model_builder
-from federated.trainer import FedAvgTrainer
+from federated.trainer import FederatedTrainer
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,13 +17,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=["mnist", "cifar10", "femnist"], default="mnist")
     parser.add_argument("--data-dir", default="data", help="Directory for downloading datasets")
     parser.add_argument("--num-clients", type=int, default=10, help="Number of simulated clients")
-    parser.add_argument("--clients-per-round", type=int, default=None, help="Number of clients participating in each round")
     parser.add_argument("--rounds", type=int, default=5, help="Number of federated rounds")
     parser.add_argument("--local-epochs", type=int, default=1, help="Number of local epochs per client")
     parser.add_argument("--batch-size", type=int, default=32, help="Local batch size")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for SGD")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for SGD")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--dropout-rate", type=float, default=0.0, help="Probability that a client drops out in a round")
+    parser.add_argument("--dropout-tolerance", type=int, default=0, help="Maximum number of tolerated dropouts per round")
     parser.add_argument("--low-quality-fraction", type=float, default=0.0, help="Fraction of clients with degraded data")
     parser.add_argument("--label-noise", type=float, default=0.0, help="Probability of random label flips")
     parser.add_argument("--gaussian-noise-std", type=float, default=0.0, help="Standard deviation of additive Gaussian noise")
@@ -35,7 +35,6 @@ def parse_args() -> argparse.Namespace:
 
 def setup_seed(seed: int) -> None:
     random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -73,26 +72,25 @@ def main() -> None:
         data_dir=args.data_dir,
     )
 
-    clients_per_round = args.clients_per_round or args.num_clients
-    if clients_per_round > len(client_loaders):
-        raise ValueError("clients_per_round cannot exceed the total number of clients")
+    if args.dropout_tolerance >= len(client_loaders):
+        raise ValueError("dropout_tolerance must be smaller than the total number of clients")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     model_builder = get_model_builder(args.dataset, info.num_classes)
-    trainer = FedAvgTrainer(
+    trainer = FederatedTrainer(
         model_builder=model_builder,
         client_loaders=client_loaders,
         test_loader=test_loader,
         device=device,
         lr=args.lr,
         local_epochs=args.local_epochs,
+        dropout_tolerance=args.dropout_tolerance,
         weight_decay=args.weight_decay,
-        seed=args.seed,
     )
 
-    _, history = trainer.train(num_rounds=args.rounds, clients_per_round=clients_per_round)
+    _, history = trainer.train(num_rounds=args.rounds, dropout_rate=args.dropout_rate)
 
     final_loss, final_acc = history[-1].test_loss, history[-1].test_accuracy
     print("=" * 80)
