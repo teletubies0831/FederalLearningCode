@@ -48,20 +48,38 @@ class SecureAggregationController:
 
         self._verify_commitments(reports)
 
-        deltas = self._compute_deltas(global_state, reports)
+        floating_keys = [
+            key for key, param in global_state.items() if torch.is_floating_point(param)
+        ]
+
+        if not floating_keys:
+            # 模型中不存在需要聚合的浮点参数，直接返回任意一个客户端的更新即可。
+            return {
+                key: reports[0].updated_state[key].clone()
+                for key in global_state.keys()
+            }
+
+        deltas = self._compute_deltas(global_state, reports, floating_keys)
         weights = self._truth_discovery_weights(deltas)
 
-        aggregated_state = {
-            key: torch.zeros_like(param) for key, param in global_state.items()
+        aggregated_updates = {
+            key: torch.zeros_like(global_state[key], dtype=torch.float32)
+            for key in floating_keys
         }
 
         normaliser = sum(weights) + 1e-12
-        for report, weight, delta in zip(reports, weights, deltas):
-            for key in aggregated_state:
-                aggregated_state[key] += weight * delta[key]
+        for weight, delta in zip(weights, deltas):
+            for key in floating_keys:
+                aggregated_updates[key] += weight * delta[key]
 
-        for key in aggregated_state:
-            aggregated_state[key] = aggregated_state[key] / normaliser + global_state[key]
+        aggregated_state: Dict[str, torch.Tensor] = {}
+        for key, base_param in global_state.items():
+            if key in aggregated_updates:
+                base = base_param.detach().to(dtype=torch.float32)
+                update = aggregated_updates[key] / normaliser + base
+                aggregated_state[key] = update.to(dtype=base_param.dtype)
+            else:
+                aggregated_state[key] = reports[0].updated_state[key].clone()
 
         return aggregated_state
 
@@ -83,13 +101,16 @@ class SecureAggregationController:
         self,
         global_state: Dict[str, torch.Tensor],
         reports: Iterable[ClientReport],
+        floating_keys: Iterable[str],
     ) -> List[Dict[str, torch.Tensor]]:
         deltas: List[Dict[str, torch.Tensor]] = []
+        float_keys = list(floating_keys)
         for report in reports:
             deltas.append(
                 {
-                    key: report.updated_state[key] - global_state[key]
-                    for key in global_state.keys()
+                    key: report.updated_state[key].to(torch.float32)
+                    - global_state[key].to(torch.float32)
+                    for key in float_keys
                 }
             )
         return deltas
@@ -98,6 +119,9 @@ class SecureAggregationController:
         self,
         deltas: List[Dict[str, torch.Tensor]],
     ) -> List[float]:
+        if not deltas:
+            return []
+
         stacked = [
             torch.cat([tensor.flatten() for tensor in delta.values()]) for delta in deltas
         ]

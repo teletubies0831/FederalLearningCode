@@ -77,6 +77,9 @@ python run_experiment.py \
 | `--pixel-dropout` | 像素随机置零的概率 |
 | `--seed` | 随机种子，确保可复现 |
 
+> **说明**：`--low-quality-fraction` 按客户端层面计算比例。例如 `--num-clients 20 --low-quality-fraction 0.3` 会随机挑选 6 个客户端，
+> 这些客户端在整个训练过程中始终使用退化后的数据集，从而模拟论文中的低质量参与方。
+
 ## 结果输出
 
 脚本会在每轮训练后输出测试集损失与精度，并在训练结束时打印最终指标。可根据 `TrainingHistory` 数据结构扩展保存或可视化逻辑。
