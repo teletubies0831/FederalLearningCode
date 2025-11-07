@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from federated.data import create_data_loaders
+from federated.data import FederatedDataBundle, create_data_loaders
 from federated.models import get_model_builder
 from federated.trainer import FederatedTrainer
 
@@ -63,7 +63,7 @@ def main() -> None:
 
     # 根据命令行参数组合低质量数据策略
     low_quality_config = build_low_quality_config(args)
-    client_loaders, test_loader, info = create_data_loaders(
+    data_bundle: FederatedDataBundle = create_data_loaders(
         dataset_name=args.dataset,
         num_clients=args.num_clients,
         batch_size=args.batch_size,
@@ -72,22 +72,23 @@ def main() -> None:
         data_dir=args.data_dir,
     )
 
-    if args.dropout_tolerance >= len(client_loaders):
+    if args.dropout_tolerance >= len(data_bundle.client_loaders):
         raise ValueError("dropout_tolerance must be smaller than the total number of clients")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model_builder = get_model_builder(args.dataset, info.num_classes)
+    model_builder = get_model_builder(args.dataset, data_bundle.info.num_classes)
     trainer = FederatedTrainer(
         model_builder=model_builder,
-        client_loaders=client_loaders,
-        test_loader=test_loader,
+        client_loaders=data_bundle.client_loaders,
+        test_loader=data_bundle.test_loader,
         device=device,
         lr=args.lr,
         local_epochs=args.local_epochs,
         dropout_tolerance=args.dropout_tolerance,
         weight_decay=args.weight_decay,
+        low_quality_clients=data_bundle.low_quality_clients,
     )
 
     _, history = trainer.train(num_rounds=args.rounds, dropout_rate=args.dropout_rate)

@@ -1,0 +1,46 @@
+{
+  "global": {
+    "dataset": "mnist",
+    "data_dir": "data",
+    "num_clients": 10,
+    "rounds": 5,
+    "local_epochs": 1,
+    "batch_size": 32,
+    "lr": 0.01,
+    "weight_decay": 0.0,
+    "dropout_rate": 0.0,
+    "dropout_tolerance": 0,
+    "seed": 42,
+    "low_quality_methods": [
+      {"type": "label_noise", "prob": 0.2},
+      {"type": "gaussian_noise", "std": 0.2},
+      {"type": "pixel_dropout", "drop_prob": 0.1}
+    ]
+  },
+  "experiments": [
+    {
+      "name": "ours",
+      "label": "Ours",
+      "aggregator": "truth_discovery",
+      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+    },
+    {
+      "name": "esfl",
+      "label": "ESFL",
+      "aggregator": "esfl",
+      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+    },
+    {
+      "name": "ppfdl",
+      "label": "PPFDL",
+      "aggregator": "ppfdl",
+      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+    }
+  ],
+  "output": {
+    "results_dir": "results",
+    "data_filename": "accuracy_plot_data.csv",
+    "plot_filename": "accuracy_comparison.png",
+    "history_filename": "training_histories.json"
+  }
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List
 
+import math
+
 import hashlib
 
 import torch
@@ -20,9 +22,16 @@ class ClientReport:
 
 
 class SecureAggregationController:
-    """Coordinate secure aggregation, dropout handling, and truth discovery."""
+    """Coordinate secure aggregation, dropout handling, and truth discovery variants."""
 
-    def __init__(self, num_clients: int, dropout_tolerance: int, max_truth_iters: int = 5) -> None:
+    def __init__(
+        self,
+        num_clients: int,
+        dropout_tolerance: int,
+        max_truth_iters: int = 5,
+        truth_strategy: str | None = "iterative",
+        min_ppfdl_weight: float = 1e-6,
+    ) -> None:
         if dropout_tolerance < 0:
             raise ValueError("dropout_tolerance must be non-negative")
         if dropout_tolerance >= num_clients:
@@ -30,6 +39,14 @@ class SecureAggregationController:
         self.num_clients = num_clients
         self.dropout_tolerance = dropout_tolerance
         self.max_truth_iters = max_truth_iters
+        strategy = (truth_strategy or "iterative").lower()
+        valid_strategies = {"iterative", "uniform", "fedavg", "esfl", "ppfdl"}
+        if strategy not in valid_strategies:
+            raise ValueError(
+                "truth_strategy must be one of 'iterative', 'uniform', 'fedavg', 'esfl', or 'ppfdl'"
+            )
+        self.truth_strategy = strategy
+        self.min_ppfdl_weight = min_ppfdl_weight
 
     def aggregate(
         self,
@@ -60,7 +77,7 @@ class SecureAggregationController:
             }
 
         deltas = self._compute_deltas(global_state, reports, floating_keys)
-        weights = self._truth_discovery_weights(deltas)
+        weights = self._compute_weights(deltas, reports)
 
         aggregated_updates = {
             key: torch.zeros_like(global_state[key], dtype=torch.float32)
@@ -138,9 +155,38 @@ class SecureAggregationController:
 
         return reliability.tolist()
 
+    def _ppfdl_weights(self, reports: List[ClientReport]) -> List[float]:
+        raw_weights: List[float] = []
+        for report in reports:
+            loss = report.training_loss
+            if not math.isfinite(loss) or loss <= 0:
+                weight = 1.0
+            else:
+                weight = 1.0 / max(loss, self.min_ppfdl_weight)
+            raw_weights.append(weight)
+
+        total_weight = sum(raw_weights)
+        if total_weight <= 0:
+            return [1.0 for _ in reports]
+        return raw_weights
+
+    def _compute_weights(
+        self,
+        deltas: List[Dict[str, torch.Tensor]],
+        reports: List[ClientReport],
+    ) -> List[float]:
+        if self.truth_strategy in {"uniform", "fedavg", "esfl"}:
+            return [1.0 for _ in reports]
+        if self.truth_strategy == "iterative":
+            return self._truth_discovery_weights(deltas)
+        if self.truth_strategy == "ppfdl":
+            return self._ppfdl_weights(reports)
+        raise RuntimeError(f"Unsupported truth discovery strategy: {self.truth_strategy}")
+
     def _commit(self, state: Dict[str, torch.Tensor]) -> str:
         hasher = hashlib.sha256()
         for key in sorted(state.keys()):
             hasher.update(key.encode("utf-8"))
             hasher.update(state[key].detach().cpu().contiguous().numpy().tobytes())
         return hasher.hexdigest()
+

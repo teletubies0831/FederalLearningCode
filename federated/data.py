@@ -19,6 +19,23 @@ class DatasetInfo:
     base_transform: Callable
 
 
+@dataclass
+class FederatedDataBundle:
+    """Structured output returned by :func:`create_data_loaders`.
+
+    Attributes:
+        client_loaders: Per-client training loaders.
+        test_loader: Shared evaluation loader.
+        info: Metadata describing the dataset.
+        low_quality_clients: Indices of clients that received low-quality data transforms.
+    """
+
+    client_loaders: List[DataLoader]
+    test_loader: DataLoader
+    info: DatasetInfo
+    low_quality_clients: List[int]
+
+
 class AddGaussianNoise:
     """Additive Gaussian noise transform for tensors."""
 
@@ -244,7 +261,7 @@ def create_data_loaders(
     low_quality_config: Optional[Dict[str, object]] = None,
     seed: int = 42,
     data_dir: str = "data",
-) -> Tuple[List[DataLoader], DataLoader, DatasetInfo]:
+) -> FederatedDataBundle:
     """Prepare federated data loaders with optional low-quality clients.
 
     Args:
@@ -256,7 +273,7 @@ def create_data_loaders(
         data_dir: Directory where torchvision datasets will be stored.
 
     Returns:
-        A tuple with client loaders, a shared test loader and dataset metadata.
+        A :class:`FederatedDataBundle` containing all prepared loaders and metadata.
     """
 
     if num_clients <= 0:
@@ -301,4 +318,9 @@ def create_data_loaders(
         client_loaders.append(loader)
 
     test_loader = DataLoader(TransformedDataset(test_dataset, info.base_transform), batch_size=batch_size)
-    return client_loaders, test_loader, info
+    return FederatedDataBundle(
+        client_loaders=client_loaders,
+        test_loader=test_loader,
+        info=info,
+        low_quality_clients=sorted(low_quality_clients),
+    )
