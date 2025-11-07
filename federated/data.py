@@ -270,9 +270,11 @@ def create_data_loaders(
 
     low_quality_clients: Sequence[int] = []
     methods: Sequence[Dict[str, float]] = []
+    print(low_quality_config)
     if low_quality_config:
         fraction = float(low_quality_config.get("fraction", 0.0))
         raw_methods = low_quality_config.get("methods", [])
+        print(fraction,raw_methods)
         if raw_methods:
             methods = list(raw_methods)  # type: ignore[arg-type]
         if methods and fraction > 0:
@@ -283,6 +285,7 @@ def create_data_loaders(
             low_quality_clients = []
     client_loaders: List[DataLoader] = []
     low_quality_set = set(low_quality_clients)
+    print(low_quality_clients)
 
     for client_idx, client_indices in enumerate(client_splits):
         image_transform: Optional[Callable] = None
