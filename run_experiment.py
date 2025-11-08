@@ -57,12 +57,40 @@ def build_low_quality_config(args: argparse.Namespace) -> Optional[Dict[str, obj
     return {"fraction": args.low_quality_fraction, "methods": methods}
 
 
+def _format_low_quality_methods(methods: List[Dict[str, object]]) -> str:
+    parts: List[str] = []
+    for method in methods:
+        method_type = str(method.get("type", "unknown"))
+        if method_type == "label_noise":
+            parts.append(f"label_noise(p={float(method.get('prob', 0.0)):.2f})")
+        elif method_type == "gaussian_noise":
+            parts.append(f"gaussian_noise(std={float(method.get('std', 0.0)):.2f})")
+        elif method_type == "gaussian_blur":
+            parts.append(f"gaussian_blur(sigma={float(method.get('sigma', 0.0)):.2f})")
+        elif method_type == "pixel_dropout":
+            parts.append(f"pixel_dropout(p={float(method.get('drop_prob', 0.0)):.2f})")
+        else:
+            parts.append(method_type)
+    return ", ".join(parts) if parts else "none"
+
+
+def log_low_quality_pipeline(config: Optional[Dict[str, object]]) -> None:
+    if not config:
+        print("Low-quality data pipeline: disabled")
+        return
+    fraction = float(config.get("fraction", 0.0))
+    methods = config.get("methods", [])
+    method_desc = _format_low_quality_methods(methods if isinstance(methods, list) else [])
+    print(f"Low-quality data pipeline: fraction={fraction:.2f} | methods={method_desc}")
+
+
 def main() -> None:
     args = parse_args()
     setup_seed(args.seed)
 
     # 根据命令行参数组合低质量数据策略
     low_quality_config = build_low_quality_config(args)
+    log_low_quality_pipeline(low_quality_config)
     data_bundle: FederatedDataBundle = create_data_loaders(
         dataset_name=args.dataset,
         num_clients=args.num_clients,

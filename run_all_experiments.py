@@ -87,6 +87,22 @@ def resolve_aggregator_factory(name: str, experiment_cfg: Dict[str, Any]) -> Cal
             )
 
         return factory
+    if name in {"ppfdl_anchor", "ppfdl_kmeans"}:
+        alpha = float(experiment_cfg.get("truth_alpha", 0.5))
+        scaling = float(experiment_cfg.get("truth_scaling", 1.0))
+        variance_floor = float(experiment_cfg.get("variance_floor", 1e-9))
+
+        def factory(num_clients: int, dropout_tolerance: int) -> SecureAggregationController:
+            return SecureAggregationController(
+                num_clients=num_clients,
+                dropout_tolerance=dropout_tolerance,
+                truth_strategy="ppfdl_anchor",
+                truth_alpha=alpha,
+                truth_scaling=scaling,
+                variance_floor=variance_floor,
+            )
+
+        return factory
     raise ValueError(f"Unsupported aggregator strategy: {name}")
 
 
@@ -94,6 +110,33 @@ def build_low_quality_config(methods: List[Dict[str, Any]], fraction: float) -> 
     if not methods or fraction <= 0:
         return None
     return {"fraction": fraction, "methods": methods}
+
+
+def _format_low_quality_methods(methods: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for method in methods:
+        method_type = str(method.get("type", "unknown"))
+        if method_type == "label_noise":
+            parts.append(f"label_noise(p={float(method.get('prob', 0.0)):.2f})")
+        elif method_type == "gaussian_noise":
+            parts.append(f"gaussian_noise(std={float(method.get('std', 0.0)):.2f})")
+        elif method_type == "gaussian_blur":
+            parts.append(f"gaussian_blur(sigma={float(method.get('sigma', 0.0)):.2f})")
+        elif method_type == "pixel_dropout":
+            parts.append(f"pixel_dropout(p={float(method.get('drop_prob', 0.0)):.2f})")
+        else:
+            parts.append(method_type)
+    return ", ".join(parts) if parts else "none"
+
+
+def log_low_quality_pipeline(scope: str, config: Dict[str, Any] | None) -> None:
+    if not config:
+        print(f"[{scope}] Low-quality data pipeline: disabled")
+        return
+    fraction = float(config.get("fraction", 0.0))
+    methods = config.get("methods", [])
+    method_desc = _format_low_quality_methods(methods if isinstance(methods, list) else [])
+    print(f"[{scope}] Low-quality data pipeline: fraction={fraction:.2f} | methods={method_desc}")
 
 
 def extract_shared_parameters(global_cfg: Dict[str, Any], experiment_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,6 +176,7 @@ def run_single_configuration(
     for fraction in fractions:
         setup_seed(int(shared_params["seed"]))
         low_quality_config = build_low_quality_config(methods, float(fraction))
+        log_low_quality_pipeline(f"{label} | fraction={fraction:.2f}", low_quality_config)
 
         data_bundle: FederatedDataBundle = create_data_loaders(
             dataset_name=str(shared_params["dataset"]),
