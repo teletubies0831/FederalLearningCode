@@ -98,6 +98,11 @@ class FederatedTrainer:
                 client_metrics,
                 key=lambda metric: metric["client_id"],
             )
+            active_clients = sorted(report.client_id for report in client_reports)
+
+            print("-" * 80)
+            print(f"Round {round_idx:03d}/{num_rounds:03d} | Active clients: {active_clients}")
+
             if metrics_by_client:
                 detailed_metrics = ", ".join(
                     f"client {metric['client_id']}: acc={metric['test_accuracy']:.4f}"
@@ -119,11 +124,8 @@ class FederatedTrainer:
 
             test_loss, test_acc = self.evaluate(global_model)
             history.append(TrainingHistory(round=round_idx, test_loss=test_loss, test_accuracy=test_acc))
-            active_clients = sorted(report.client_id for report in client_reports)
-            print(
-                f"Round {round_idx:03d}/{num_rounds:03d} | Active clients: {active_clients} | "
-                f"Test loss: {test_loss:.4f} | Test acc: {test_acc:.4f}"
-            )
+            print(f"    Post-aggregation metrics -> loss={test_loss:.4f}, acc={test_acc:.4f}")
+            print("-" * 80)
 
         return global_model, history
 

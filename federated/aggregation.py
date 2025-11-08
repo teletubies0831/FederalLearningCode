@@ -62,6 +62,7 @@ class SecureAggregationController:
         self.variance_floor = float(variance_floor)
         if self.variance_floor <= 0:
             raise ValueError("variance_floor must be positive")
+        self._prev_update_vector: torch.Tensor | None = None
 
     def aggregate(
         self,
@@ -107,13 +108,19 @@ class SecureAggregationController:
                 aggregated_updates[key] += weight * delta[key]
 
         aggregated_state: Dict[str, torch.Tensor] = {}
+        aggregated_delta_vector: List[torch.Tensor] = []
         for key, base_param in global_state.items():
             if key in aggregated_updates:
                 base = base_param.detach().to(dtype=torch.float32)
-                update = aggregated_updates[key] / normaliser + base
+                delta = aggregated_updates[key] / normaliser
+                update = delta + base
                 aggregated_state[key] = update.to(dtype=base_param.dtype)
+                aggregated_delta_vector.append(delta.flatten().to(torch.float64))
             else:
                 aggregated_state[key] = reports[0].updated_state[key].clone()
+
+        if aggregated_delta_vector:
+            self._prev_update_vector = torch.cat(aggregated_delta_vector)
 
         return aggregated_state, weights
 
@@ -152,7 +159,7 @@ class SecureAggregationController:
     def _truth_discovery_weights(self, deltas):
         if not deltas:
             return []
-        # 扁平化 Δ_i
+
         updates = torch.stack([
             torch.cat([t.flatten().to(torch.float64) for t in delta.values()])
             for delta in deltas
@@ -160,33 +167,48 @@ class SecureAggregationController:
         if updates.size(0) == 1:
             return [1.0]
 
-        # 只看与上一轮全局的距离：||Δ_i||^2
-        norm2 = (updates * updates).sum(dim=1)          # [n]
         m = float(updates.size(1))
-
-        # 稳健标量尺度：s^2 = median(||Δ||^2) / m，避免逐维方差过小 → 爆χ²
-        s2 = (torch.median(norm2).item() / max(m, 1.0)) + 1e-12
-        chi_like = norm2 / s2                            # 近似 ~ χ²_m
-
-        # 门限：χ²_{1-α/2, m}（SciPy在则精确，否则 Wilson–Hilferty 近似）
         if _HAVE_SCIPY:
-            critical = float(_scipy_stats.chi2.ppf(1.0 - self.truth_alpha / 2.0, df=m))
+            chi_quantile = float(_scipy_stats.chi2.ppf(1.0 - self.truth_alpha / 2.0, df=m))
         else:
-            z = torch.distributions.Normal(0.0, 1.0).icdf(
-                torch.tensor(1.0 - self.truth_alpha / 2.0, dtype=updates.dtype)
-            ).item()
+            z = torch.distributions.Normal(0.0, 1.0)
+            z_high = z.icdf(torch.tensor(1.0 - self.truth_alpha / 2.0, dtype=updates.dtype)).item()
             gamma = 2.0 / (9.0 * m)
-            critical = m * (1.0 - gamma + z * math.sqrt(gamma)) ** 3
+            chi_quantile = m * (1.0 - gamma + z_high * math.sqrt(gamma)) ** 3
 
-        # 权重：超门限→0；否则线性衰减到 0
-        raw = torch.clamp(critical - chi_like, min=0.0)
-        w = self.truth_scaling * raw / (critical + 1e-12)
+        scale = self.truth_scaling * max(chi_quantile, self.variance_floor)
 
-        # 兜底：若全 0 则退回均匀
-        if float(w.sum()) <= 0.0:
+        prev_truth = self._prev_update_vector
+        if prev_truth is None or prev_truth.numel() != updates.size(1):
+            truth = updates.mean(dim=0)
+        else:
+            truth = prev_truth.clone()
+
+        weights = torch.ones(updates.size(0), dtype=torch.float32, device=updates.device)
+        for _ in range(self.max_truth_iters):
+            dist2 = (updates - truth).pow(2).sum(dim=1)
+            norm2 = updates.pow(2).sum(dim=1)
+            weights = (scale * norm2 / (dist2 + self.variance_floor)).to(torch.float32)
+
+            if not torch.isfinite(weights).all():
+                weights = torch.where(
+                    torch.isfinite(weights), weights, torch.full_like(weights, 1.0)
+                )
+
+            weight_sum = weights.sum().item()
+            if weight_sum <= 0.0:
+                weights = torch.ones_like(weights)
+                break
+
+            updated_truth = (weights[:, None] * updates).sum(dim=0) / (weight_sum + 1e-12)
+            if torch.allclose(updated_truth, truth, atol=1e-8, rtol=1e-5):
+                truth = updated_truth
+                break
+            truth = updated_truth
+
+        if float(weights.sum()) <= 0.0:
             return [1.0 for _ in deltas]
-        return w.to(torch.float32).tolist()
-
+        return weights.tolist()
 
     def _compute_weights(
         self,
