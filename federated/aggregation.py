@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import hashlib
 
@@ -67,7 +67,7 @@ class SecureAggregationController:
         self,
         global_state: Dict[str, torch.Tensor],
         client_reports: Iterable[ClientReport],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], List[float]]:
         reports = list(client_reports)
         if not reports:
             raise RuntimeError("No available client reports for aggregation")
@@ -86,10 +86,12 @@ class SecureAggregationController:
 
         if not floating_keys:
             # 模型中不存在需要聚合的浮点参数，直接返回任意一个客户端的更新即可。
-            return {
+            aggregated = {
                 key: reports[0].updated_state[key].clone()
                 for key in global_state.keys()
             }
+            weights = [1.0 for _ in reports]
+            return aggregated, weights
 
         deltas = self._compute_deltas(global_state, reports, floating_keys)
         weights = self._compute_weights(deltas, reports)
@@ -113,7 +115,7 @@ class SecureAggregationController:
             else:
                 aggregated_state[key] = reports[0].updated_state[key].clone()
 
-        return aggregated_state
+        return aggregated_state, weights
 
     def _verify_commitments(self, reports: List[ClientReport]) -> None:
         seen = set()

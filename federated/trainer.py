@@ -19,7 +19,7 @@ class AggregationControllerProtocol(Protocol):
         self,
         global_state: Dict[str, torch.Tensor],
         client_reports: Iterable[ClientReport],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], List[float]]:
         ...
 
 
@@ -89,37 +89,41 @@ class FederatedTrainer:
 
         for round_idx in range(1, num_rounds + 1):
             global_state = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
-            client_reports, low_quality_metrics = self._collect_client_reports(
+            client_reports, client_metrics = self._collect_client_reports(
                 round_idx=round_idx,
                 global_state=global_state,
                 dropout_rate=dropout_rate,
             )
-            aggregated_state = aggregator.aggregate(global_state, client_reports)
+            metrics_by_client = sorted(
+                client_metrics,
+                key=lambda metric: metric["client_id"],
+            )
+            if metrics_by_client:
+                detailed_metrics = ", ".join(
+                    f"client {metric['client_id']}: acc={metric['test_accuracy']:.4f}"
+                    for metric in metrics_by_client
+                )
+                print(f"    Pre-aggregation test accuracy -> {detailed_metrics}")
+
+            aggregated_state, aggregation_weights = aggregator.aggregate(
+                global_state, client_reports
+            )
+            if aggregation_weights:
+                weight_sum = sum(aggregation_weights) or 1.0
+                detailed_weights = ", ".join(
+                    f"client {report.client_id}: weight={weight / weight_sum:.4f}"
+                    for report, weight in zip(client_reports, aggregation_weights)
+                )
+                print(f"    Aggregation weights -> {detailed_weights}")
             global_model.load_state_dict(aggregated_state)
 
             test_loss, test_acc = self.evaluate(global_model)
             history.append(TrainingHistory(round=round_idx, test_loss=test_loss, test_accuracy=test_acc))
             active_clients = sorted(report.client_id for report in client_reports)
-            low_quality_active = [metric["client_id"] for metric in low_quality_metrics]
-            mean_low_quality_acc = None
-            if low_quality_metrics:
-                mean_low_quality_acc = sum(metric["test_accuracy"] for metric in low_quality_metrics) / len(low_quality_metrics)
             print(
                 f"Round {round_idx:03d}/{num_rounds:03d} | Active clients: {active_clients} | "
                 f"Test loss: {test_loss:.4f} | Test acc: {test_acc:.4f}"
             )
-            if low_quality_metrics:
-                detailed = ", ".join(
-                    f"client {metric['client_id']}: acc={metric['test_accuracy']:.4f}"
-                    for metric in low_quality_metrics
-                )
-                print(
-                    f"    Low-quality active clients: {low_quality_active} | "
-                    f"Mean pre-aggregation test acc: {mean_low_quality_acc:.4f}"
-                )
-                print(f"    Per-client pre-aggregation accuracy -> {detailed}")
-            elif self.low_quality_clients:
-                print("    No low-quality clients participated in this round (dropout).")
 
         return global_model, history
 
@@ -133,8 +137,8 @@ class FederatedTrainer:
 
         Returns:
             Tuple containing the collected client reports and a list of
-            dictionaries with pre-aggregation evaluation metrics for low-quality
-            clients that participated in the round.
+            dictionaries with pre-aggregation evaluation metrics for all
+            participating clients in the round.
         """
 
         generator = torch.Generator().manual_seed(round_idx)
@@ -158,7 +162,7 @@ class FederatedTrainer:
             allowed_dropouts = set(tentative_dropouts)
 
         reports: List[ClientReport] = []
-        low_quality_metrics: List[Dict[str, float]] = []
+        client_metrics: List[Dict[str, float]] = []
 
         for client_id, loader in enumerate(self.client_loaders):
             if client_id in allowed_dropouts:
@@ -178,17 +182,16 @@ class FederatedTrainer:
                 )
             )
 
-            if client_id in self.low_quality_clients:
-                pre_loss, pre_acc = self.evaluate(client_model)
-                low_quality_metrics.append(
-                    {
-                        "client_id": client_id,
-                        "test_loss": pre_loss,
-                        "test_accuracy": pre_acc,
-                    }
-                )
+            pre_loss, pre_acc = self.evaluate(client_model)
+            client_metrics.append(
+                {
+                    "client_id": client_id,
+                    "test_loss": pre_loss,
+                    "test_accuracy": pre_acc,
+                }
+            )
 
-        return reports, low_quality_metrics
+        return reports, client_metrics
 
     def _commit_state(self, state: Dict[str, torch.Tensor]) -> str:
         """Compute a SHA256 commitment for ``state``."""
