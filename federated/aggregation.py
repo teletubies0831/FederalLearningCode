@@ -7,6 +7,13 @@ from typing import Dict, Iterable, List
 import hashlib
 
 import torch
+import math
+
+try:  # Optional SciPy for accurate chi-square quantiles
+    import scipy.stats as _scipy_stats  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:  # SciPy not installed
+    _HAVE_SCIPY = False
 
 
 @dataclass
@@ -140,46 +147,44 @@ class SecureAggregationController:
             )
         return deltas
 
-    def _truth_discovery_weights(
-        self,
-        deltas: List[Dict[str, torch.Tensor]],
-    ) -> List[float]:
+    def _truth_discovery_weights(self, deltas):
         if not deltas:
             return []
-
-        flattened_updates = [
-            torch.cat([tensor.flatten().to(dtype=torch.float64) for tensor in delta.values()])
+        # 扁平化 Δ_i
+        updates = torch.stack([
+            torch.cat([t.flatten().to(torch.float64) for t in delta.values()])
             for delta in deltas
-        ]
-        updates = torch.stack(flattened_updates)
-
+        ])  # [n, m]
         if updates.size(0) == 1:
             return [1.0]
 
-        mean_update = updates.mean(dim=0)
-        diffs = updates - mean_update
-        variances = torch.var(updates, dim=0, unbiased=False)
-        variances = torch.clamp(variances, min=self.variance_floor)
-        normalised = diffs * diffs / variances
-        mahalanobis = normalised.sum(dim=1)
+        # 只看与上一轮全局的距离：||Δ_i||^2
+        norm2 = (updates * updates).sum(dim=1)          # [n]
+        m = float(updates.size(1))
 
-        degrees_of_freedom = float(updates.size(1))
-        chi2 = torch.distributions.chi2.Chi2(
-            torch.tensor(degrees_of_freedom, dtype=updates.dtype)
-        )
-        critical_value = chi2.icdf(
-            torch.tensor(1.0 - self.truth_alpha / 2.0, dtype=updates.dtype)
-        )
-        # Ensure numerical stability in extreme cases.
-        critical_value = max(float(critical_value.item()), self.variance_floor)
+        # 稳健标量尺度：s^2 = median(||Δ||^2) / m，避免逐维方差过小 → 爆χ²
+        s2 = (torch.median(norm2).item() / max(m, 1.0)) + 1e-12
+        chi_like = norm2 / s2                            # 近似 ~ χ²_m
 
-        raw_weights = torch.clamp(critical_value - mahalanobis, min=0.0)
-        scaled_weights = self.truth_scaling * raw_weights / (critical_value + 1e-12)
+        # 门限：χ²_{1-α/2, m}（SciPy在则精确，否则 Wilson–Hilferty 近似）
+        if _HAVE_SCIPY:
+            critical = float(_scipy_stats.chi2.ppf(1.0 - self.truth_alpha / 2.0, df=m))
+        else:
+            z = torch.distributions.Normal(0.0, 1.0).icdf(
+                torch.tensor(1.0 - self.truth_alpha / 2.0, dtype=updates.dtype)
+            ).item()
+            gamma = 2.0 / (9.0 * m)
+            critical = m * (1.0 - gamma + z * math.sqrt(gamma)) ** 3
 
-        if float(scaled_weights.sum()) <= 0.0:
+        # 权重：超门限→0；否则线性衰减到 0
+        raw = torch.clamp(critical - chi_like, min=0.0)
+        w = self.truth_scaling * raw / (critical + 1e-12)
+
+        # 兜底：若全 0 则退回均匀
+        if float(w.sum()) <= 0.0:
             return [1.0 for _ in deltas]
+        return w.to(torch.float32).tolist()
 
-        return scaled_weights.to(dtype=torch.float32).tolist()
 
     def _compute_weights(
         self,
