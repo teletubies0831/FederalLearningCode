@@ -4,11 +4,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List
 
-import math
-
 import hashlib
 
 import torch
+import math
+
+try:  # Optional SciPy for accurate chi-square quantiles
+    import scipy.stats as _scipy_stats  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:  # SciPy not installed
+    _HAVE_SCIPY = False
 
 
 @dataclass
@@ -30,7 +35,9 @@ class SecureAggregationController:
         dropout_tolerance: int,
         max_truth_iters: int = 5,
         truth_strategy: str | None = "iterative",
-        min_ppfdl_weight: float = 1e-6,
+        truth_alpha: float = 0.05,
+        truth_scaling: float = 1.0,
+        variance_floor: float = 1e-9,
     ) -> None:
         if dropout_tolerance < 0:
             raise ValueError("dropout_tolerance must be non-negative")
@@ -46,7 +53,15 @@ class SecureAggregationController:
                 "truth_strategy must be one of 'iterative', 'uniform', 'fedavg', 'esfl', or 'ppfdl'"
             )
         self.truth_strategy = strategy
-        self.min_ppfdl_weight = min_ppfdl_weight
+        self.truth_alpha = float(truth_alpha)
+        if not 0.0 < self.truth_alpha < 1.0:
+            raise ValueError("truth_alpha must be between 0 and 1")
+        self.truth_scaling = float(truth_scaling)
+        if self.truth_scaling <= 0:
+            raise ValueError("truth_scaling must be positive")
+        self.variance_floor = float(variance_floor)
+        if self.variance_floor <= 0:
+            raise ValueError("variance_floor must be positive")
 
     def aggregate(
         self,
@@ -132,43 +147,44 @@ class SecureAggregationController:
             )
         return deltas
 
-    def _truth_discovery_weights(
-        self,
-        deltas: List[Dict[str, torch.Tensor]],
-    ) -> List[float]:
+    def _truth_discovery_weights(self, deltas):
         if not deltas:
             return []
+        # 扁平化 Δ_i
+        updates = torch.stack([
+            torch.cat([t.flatten().to(torch.float64) for t in delta.values()])
+            for delta in deltas
+        ])  # [n, m]
+        if updates.size(0) == 1:
+            return [1.0]
 
-        stacked = [
-            torch.cat([tensor.flatten() for tensor in delta.values()]) for delta in deltas
-        ]
-        stacked_tensor = torch.stack(stacked)
+        # 只看与上一轮全局的距离：||Δ_i||^2
+        norm2 = (updates * updates).sum(dim=1)          # [n]
+        m = float(updates.size(1))
 
-        reliability = torch.ones(len(deltas))
-        consensus = torch.zeros_like(stacked_tensor[0])
+        # 稳健标量尺度：s^2 = median(||Δ||^2) / m，避免逐维方差过小 → 爆χ²
+        s2 = (torch.median(norm2).item() / max(m, 1.0)) + 1e-12
+        chi_like = norm2 / s2                            # 近似 ~ χ²_m
 
-        for _ in range(self.max_truth_iters):
-            weighted_sum = torch.sum(reliability[:, None] * stacked_tensor, dim=0)
-            consensus = weighted_sum / (reliability.sum() + 1e-12)
-            distances = torch.norm(stacked_tensor - consensus, dim=1) + 1e-6
-            reliability = 1.0 / distances
+        # 门限：χ²_{1-α/2, m}（SciPy在则精确，否则 Wilson–Hilferty 近似）
+        if _HAVE_SCIPY:
+            critical = float(_scipy_stats.chi2.ppf(1.0 - self.truth_alpha / 2.0, df=m))
+        else:
+            z = torch.distributions.Normal(0.0, 1.0).icdf(
+                torch.tensor(1.0 - self.truth_alpha / 2.0, dtype=updates.dtype)
+            ).item()
+            gamma = 2.0 / (9.0 * m)
+            critical = m * (1.0 - gamma + z * math.sqrt(gamma)) ** 3
 
-        return reliability.tolist()
+        # 权重：超门限→0；否则线性衰减到 0
+        raw = torch.clamp(critical - chi_like, min=0.0)
+        w = self.truth_scaling * raw / (critical + 1e-12)
 
-    def _ppfdl_weights(self, reports: List[ClientReport]) -> List[float]:
-        raw_weights: List[float] = []
-        for report in reports:
-            loss = report.training_loss
-            if not math.isfinite(loss) or loss <= 0:
-                weight = 1.0
-            else:
-                weight = 1.0 / max(loss, self.min_ppfdl_weight)
-            raw_weights.append(weight)
+        # 兜底：若全 0 则退回均匀
+        if float(w.sum()) <= 0.0:
+            return [1.0 for _ in deltas]
+        return w.to(torch.float32).tolist()
 
-        total_weight = sum(raw_weights)
-        if total_weight <= 0:
-            return [1.0 for _ in reports]
-        return raw_weights
 
     def _compute_weights(
         self,
@@ -177,10 +193,8 @@ class SecureAggregationController:
     ) -> List[float]:
         if self.truth_strategy in {"uniform", "fedavg", "esfl"}:
             return [1.0 for _ in reports]
-        if self.truth_strategy == "iterative":
+        if self.truth_strategy in {"iterative", "ppfdl"}:
             return self._truth_discovery_weights(deltas)
-        if self.truth_strategy == "ppfdl":
-            return self._ppfdl_weights(reports)
         raise RuntimeError(f"Unsupported truth discovery strategy: {self.truth_strategy}")
 
     def _commit(self, state: Dict[str, torch.Tensor]) -> str:

@@ -12,9 +12,9 @@
     "dropout_tolerance": 0,
     "seed": 42,
     "low_quality_methods": [
-      {"type": "label_noise", "prob": 0.2},
-      {"type": "gaussian_noise", "std": 0.2},
-      {"type": "pixel_dropout", "drop_prob": 0.1}
+      {"type": "label_noise", "prob": 0.8},
+      {"type": "gaussian_noise", "std": 0.8},
+      {"type": "pixel_dropout", "drop_prob": 0.8}
     ]
   },
   "experiments": [
@@ -22,19 +22,19 @@
       "name": "ours",
       "label": "Ours",
       "aggregator": "truth_discovery",
-      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+      "fractions": [0.4, 0.8]
     },
     {
       "name": "esfl",
       "label": "ESFL",
       "aggregator": "esfl",
-      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+      "fractions": [0.4, 0.8]
     },
     {
       "name": "ppfdl",
       "label": "PPFDL",
       "aggregator": "ppfdl",
-      "fractions": [0.0, 0.05, 0.1, 0.2, 0.3]
+      "fractions": [0.4, 0.8]
     }
   ],
   "output": {
