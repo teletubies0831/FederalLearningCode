@@ -45,6 +45,9 @@ def resolve_aggregator_factory(name: str, experiment_cfg: Dict[str, Any]) -> Cal
     name = name.lower()
     if name in {"ours", "secure_truth", "truth_discovery"}:
         max_iters = int(experiment_cfg.get("max_truth_iters", 5))
+        alpha = float(experiment_cfg.get("truth_alpha", 0.05))
+        scaling = float(experiment_cfg.get("truth_scaling", 1.0))
+        variance_floor = float(experiment_cfg.get("variance_floor", 1e-9))
 
         def factory(num_clients: int, dropout_tolerance: int) -> SecureAggregationController:
             return SecureAggregationController(
@@ -52,6 +55,9 @@ def resolve_aggregator_factory(name: str, experiment_cfg: Dict[str, Any]) -> Cal
                 dropout_tolerance=dropout_tolerance,
                 max_truth_iters=max_iters,
                 truth_strategy="iterative",
+                truth_alpha=alpha,
+                truth_scaling=scaling,
+                variance_floor=variance_floor,
             )
 
         return factory
@@ -66,14 +72,18 @@ def resolve_aggregator_factory(name: str, experiment_cfg: Dict[str, Any]) -> Cal
 
         return factory
     if name == "ppfdl":
-        min_weight = float(experiment_cfg.get("min_ppfdl_weight", 1e-6))
+        alpha = float(experiment_cfg.get("truth_alpha", 0.05))
+        scaling = float(experiment_cfg.get("truth_scaling", 1.0))
+        variance_floor = float(experiment_cfg.get("variance_floor", 1e-9))
 
         def factory(num_clients: int, dropout_tolerance: int) -> SecureAggregationController:
             return SecureAggregationController(
                 num_clients=num_clients,
                 dropout_tolerance=dropout_tolerance,
                 truth_strategy="ppfdl",
-                min_ppfdl_weight=min_weight,
+                truth_alpha=alpha,
+                truth_scaling=scaling,
+                variance_floor=variance_floor,
             )
 
         return factory
