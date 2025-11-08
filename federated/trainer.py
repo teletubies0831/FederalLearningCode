@@ -1,4 +1,4 @@
-"""Federated training with secure aggregation, dropout tolerance, and truth discovery."""
+"""Federated training with configurable aggregation strategies."""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from .aggregation import ClientReport, SecureAggregationController
+from .aggregation import ClientReport, build_aggregator
 
 
 @dataclass
@@ -34,6 +34,7 @@ class FederatedTrainer:
         local_epochs: int,
         dropout_tolerance: int,
         weight_decay: float = 0.0,
+        aggregator: str = "truth_discovery",
     ) -> None:
         self.model_builder = model_builder
         self.client_loaders = client_loaders
@@ -43,6 +44,7 @@ class FederatedTrainer:
         self.local_epochs = local_epochs
         self.dropout_tolerance = dropout_tolerance
         self.weight_decay = weight_decay
+        self.aggregator_name = aggregator
 
     def train(
         self,
@@ -57,7 +59,11 @@ class FederatedTrainer:
         global_model = self.model_builder().to(self.device)
         history: List[TrainingHistory] = []
         num_clients = len(self.client_loaders)
-        aggregator = SecureAggregationController(num_clients=num_clients, dropout_tolerance=self.dropout_tolerance)
+        aggregator, requires_commitment = build_aggregator(
+            self.aggregator_name,
+            num_clients=num_clients,
+            dropout_tolerance=self.dropout_tolerance,
+        )
 
         for round_idx in range(1, num_rounds + 1):
             global_state = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
@@ -66,6 +72,7 @@ class FederatedTrainer:
                     round_idx=round_idx,
                     global_state=global_state,
                     dropout_rate=dropout_rate,
+                    require_commitment=requires_commitment,
                 )
             )
 
@@ -87,6 +94,7 @@ class FederatedTrainer:
         round_idx: int,
         global_state: Dict[str, torch.Tensor],
         dropout_rate: float,
+        require_commitment: bool,
     ) -> Iterable[ClientReport]:
         """Train every client sequentially and emit secure reports."""
 
@@ -118,23 +126,13 @@ class FederatedTrainer:
             client_model.load_state_dict({k: v.clone().to(self.device) for k, v in global_state.items()})
             training_loss = self._train_single_client(client_model, loader)
             client_state = {k: v.detach().cpu() for k, v in client_model.state_dict().items()}
-            commitment = self._commit_state(client_state)
+            commitment = self._commit_state(client_state) if require_commitment else None
             yield ClientReport(
                 client_id=client_id,
                 updated_state=client_state,
                 training_loss=training_loss,
                 commitment=commitment,
             )
-
-    def _commit_state(self, state: Dict[str, torch.Tensor]) -> str:
-        """Compute a SHA256 commitment for ``state``."""
-
-        hasher = hashlib.sha256()
-        for key in sorted(state.keys()):
-            tensor_bytes = state[key].contiguous().numpy().tobytes()
-            hasher.update(key.encode("utf-8"))
-            hasher.update(tensor_bytes)
-        return hasher.hexdigest()
 
     def _train_single_client(self, model: nn.Module, loader: DataLoader) -> float:
         model.train()
@@ -180,3 +178,13 @@ class FederatedTrainer:
         mean_loss = total_loss / total_samples
         accuracy = total_correct / total_samples
         return mean_loss, accuracy
+
+    def _commit_state(self, state: Dict[str, torch.Tensor]) -> str:
+        """Compute a SHA256 commitment for ``state``."""
+
+        hasher = hashlib.sha256()
+        for key in sorted(state.keys()):
+            tensor_bytes = state[key].detach().cpu().contiguous().numpy().tobytes()
+            hasher.update(key.encode("utf-8"))
+            hasher.update(tensor_bytes)
+        return hasher.hexdigest()

@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--dropout-rate", type=float, default=0.0, help="Probability that a client drops out in a round")
     parser.add_argument("--dropout-tolerance", type=int, default=0, help="Maximum number of tolerated dropouts per round")
+    parser.add_argument(
+        "--aggregator",
+        choices=["truth_discovery", "esfl", "fedavg", "ppfdl"],
+        default="truth_discovery",
+        help="Aggregation strategy to use (truth_discovery, esfl/fedavg, ppfdl)",
+    )
     parser.add_argument("--low-quality-fraction", type=float, default=0.0, help="Fraction of clients with degraded data")
     parser.add_argument("--label-noise", type=float, default=0.0, help="Probability of random label flips")
     parser.add_argument("--gaussian-noise-std", type=float, default=0.0, help="Standard deviation of additive Gaussian noise")
@@ -88,6 +94,7 @@ def main() -> None:
         local_epochs=args.local_epochs,
         dropout_tolerance=args.dropout_tolerance,
         weight_decay=args.weight_decay,
+        aggregator=args.aggregator,
     )
 
     _, history = trainer.train(num_rounds=args.rounds, dropout_rate=args.dropout_rate)

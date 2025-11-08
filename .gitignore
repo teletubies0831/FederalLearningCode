@@ -1,4 +1,6 @@
 /data/
+__pycache__/
+*.pyc
 *.tar
 *.tar.gz
 *.zip

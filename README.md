@@ -70,6 +70,7 @@ python run_experiment.py \
 | `--lr` / `--weight-decay` | 本地优化器（SGD）的学习率与权重衰减 |
 | `--dropout-rate` | 每轮模拟客户端掉线的概率 |
 | `--dropout-tolerance` | 安全聚合所能容忍的最大掉线数量 |
+| `--aggregator` | 聚合策略，支持 `truth_discovery`、`esfl`/`fedavg`、`ppfdl` |
 | `--low-quality-fraction` | 被设定为低质量客户端的比例（0~1） |
 | `--label-noise` | 标签翻转概率 |
 | `--gaussian-noise-std` | 添加到像素的高斯噪声标准差 |

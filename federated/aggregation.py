@@ -1,10 +1,9 @@
-"""Secure aggregation primitives closely matching the thesis protocol."""
+"""Aggregation strategies for different federated learning baselines."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List
-
 import hashlib
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 
@@ -16,20 +15,19 @@ class ClientReport:
     client_id: int
     updated_state: Dict[str, torch.Tensor]
     training_loss: float
-    commitment: str
+    commitment: str | None = None
 
 
-class SecureAggregationController:
-    """Coordinate secure aggregation, dropout handling, and truth discovery."""
+class FedAvgAggregator:
+    """Coordinate aggregation with FedAvg-style averaging and dropout tolerance."""
 
-    def __init__(self, num_clients: int, dropout_tolerance: int, max_truth_iters: int = 5) -> None:
+    def __init__(self, num_clients: int, dropout_tolerance: int) -> None:
         if dropout_tolerance < 0:
             raise ValueError("dropout_tolerance must be non-negative")
         if dropout_tolerance >= num_clients:
             raise ValueError("dropout_tolerance must be smaller than the number of clients")
         self.num_clients = num_clients
         self.dropout_tolerance = dropout_tolerance
-        self.max_truth_iters = max_truth_iters
 
     def aggregate(
         self,
@@ -37,6 +35,22 @@ class SecureAggregationController:
         client_reports: Iterable[ClientReport],
     ) -> Dict[str, torch.Tensor]:
         reports = list(client_reports)
+        self._validate_reports(reports)
+
+        aggregated_state: Dict[str, torch.Tensor] = {}
+        for key, param in global_state.items():
+            if torch.is_floating_point(param):
+                stacked = torch.stack(
+                    [report.updated_state[key].to(torch.float32) for report in reports]
+                )
+                mean_param = stacked.mean(dim=0).to(dtype=param.dtype)
+                aggregated_state[key] = mean_param.clone()
+            else:
+                aggregated_state[key] = reports[0].updated_state[key].clone()
+
+        return aggregated_state
+
+    def _validate_reports(self, reports: List[ClientReport]) -> None:
         if not reports:
             raise RuntimeError("No available client reports for aggregation")
 
@@ -46,18 +60,59 @@ class SecureAggregationController:
                 f"expected at least {self.num_clients - self.dropout_tolerance}, got {len(reports)}"
             )
 
+
+class PPFDLAggregator(FedAvgAggregator):
+    """Weighted averaging that down-weights high-loss clients (PPFDL baseline)."""
+
+    def aggregate(
+        self,
+        global_state: Dict[str, torch.Tensor],
+        client_reports: Iterable[ClientReport],
+    ) -> Dict[str, torch.Tensor]:
+        reports = list(client_reports)
+        self._validate_reports(reports)
+
+        weights = [1.0 / (report.training_loss + 1e-8) for report in reports]
+        normaliser = sum(weights)
+        aggregated_state: Dict[str, torch.Tensor] = {}
+
+        for key, param in global_state.items():
+            if torch.is_floating_point(param):
+                accumulator = torch.zeros_like(param, dtype=torch.float32)
+                for weight, report in zip(weights, reports):
+                    accumulator += weight * report.updated_state[key].to(torch.float32)
+                averaged = (accumulator / normaliser).to(dtype=param.dtype)
+                aggregated_state[key] = averaged.clone()
+            else:
+                aggregated_state[key] = reports[0].updated_state[key].clone()
+
+        return aggregated_state
+
+
+class TruthDiscoveryAggregator(FedAvgAggregator):
+    """Secure aggregation with commitment checks and truth discovery weighting."""
+
+    def __init__(
+        self,
+        num_clients: int,
+        dropout_tolerance: int,
+        max_truth_iters: int = 5,
+    ) -> None:
+        super().__init__(num_clients=num_clients, dropout_tolerance=dropout_tolerance)
+        self.max_truth_iters = max_truth_iters
+
+    def aggregate(
+        self,
+        global_state: Dict[str, torch.Tensor],
+        client_reports: Iterable[ClientReport],
+    ) -> Dict[str, torch.Tensor]:
+        reports = list(client_reports)
+        self._validate_reports(reports)
         self._verify_commitments(reports)
 
-        floating_keys = [
-            key for key, param in global_state.items() if torch.is_floating_point(param)
-        ]
-
+        floating_keys = [key for key, param in global_state.items() if torch.is_floating_point(param)]
         if not floating_keys:
-            # 模型中不存在需要聚合的浮点参数，直接返回任意一个客户端的更新即可。
-            return {
-                key: reports[0].updated_state[key].clone()
-                for key in global_state.keys()
-            }
+            return {key: reports[0].updated_state[key].clone() for key in global_state.keys()}
 
         deltas = self._compute_deltas(global_state, reports, floating_keys)
         weights = self._truth_discovery_weights(deltas)
@@ -66,8 +121,8 @@ class SecureAggregationController:
             key: torch.zeros_like(global_state[key], dtype=torch.float32)
             for key in floating_keys
         }
-
         normaliser = sum(weights) + 1e-12
+
         for weight, delta in zip(weights, deltas):
             for key in floating_keys:
                 aggregated_updates[key] += weight * delta[key]
@@ -86,6 +141,10 @@ class SecureAggregationController:
     def _verify_commitments(self, reports: List[ClientReport]) -> None:
         seen = set()
         for report in reports:
+            if not report.commitment:
+                raise RuntimeError(
+                    "TruthDiscoveryAggregator requires commitments on every client report"
+                )
             if report.commitment in seen:
                 raise RuntimeError(
                     "Commitment collision detected; secure aggregation aborted"
@@ -122,9 +181,7 @@ class SecureAggregationController:
         if not deltas:
             return []
 
-        stacked = [
-            torch.cat([tensor.flatten() for tensor in delta.values()]) for delta in deltas
-        ]
+        stacked = [torch.cat([tensor.flatten() for tensor in delta.values()]) for delta in deltas]
         stacked_tensor = torch.stack(stacked)
 
         reliability = torch.ones(len(deltas))
@@ -144,3 +201,32 @@ class SecureAggregationController:
             hasher.update(key.encode("utf-8"))
             hasher.update(state[key].detach().cpu().contiguous().numpy().tobytes())
         return hasher.hexdigest()
+
+
+def build_aggregator(
+    name: str,
+    num_clients: int,
+    dropout_tolerance: int,
+) -> Tuple[FedAvgAggregator, bool]:
+    """Construct an aggregation strategy and whether commitments are required."""
+
+    canonical = name.lower()
+    if canonical in {"truth_discovery", "ours"}:
+        return TruthDiscoveryAggregator(num_clients, dropout_tolerance), True
+    if canonical in {"esfl", "fedavg"}:
+        return FedAvgAggregator(num_clients, dropout_tolerance), False
+    if canonical == "ppfdl":
+        return PPFDLAggregator(num_clients, dropout_tolerance), False
+    supported = ["truth_discovery", "ours", "esfl", "fedavg", "ppfdl"]
+    raise ValueError(
+        f"Unsupported aggregation strategy '{name}'. Supported strategies: {', '.join(supported)}"
+    )
+
+
+__all__ = [
+    "ClientReport",
+    "FedAvgAggregator",
+    "PPFDLAggregator",
+    "TruthDiscoveryAggregator",
+    "build_aggregator",
+]
