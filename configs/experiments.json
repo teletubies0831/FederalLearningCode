@@ -1,9 +1,9 @@
 {
   "global": {
-    "dataset": "mnist",
+    "dataset": "cifar10",
     "data_dir": "data",
-    "num_clients": 10,
-    "rounds": 5,
+    "num_clients": 6,
+    "rounds": 20,
     "local_epochs": 1,
     "batch_size": 32,
     "lr": 0.01,
@@ -12,29 +12,50 @@
     "dropout_tolerance": 0,
     "seed": 42,
     "low_quality_methods": [
-      {"type": "label_noise", "prob": 0.8},
-      {"type": "gaussian_noise", "std": 0.8},
-      {"type": "pixel_dropout", "drop_prob": 0.8}
+      {
+        "type": "label_noise",
+        "prob": 0.8
+      },
+      {
+        "type": "gaussian_noise",
+        "std": 0.8
+      },
+      {
+        "type": "pixel_dropout",
+        "drop_prob": 0.8
+      }
     ]
   },
   "experiments": [
     {
       "name": "ours",
       "label": "Ours",
-      "aggregator": "truth_discovery",
-      "fractions": [0.4, 0.8]
+      "aggregator": "ours",
+      "fractions": [
+        0.4,
+        0.6
+      ],
+      "truth_alpha": 0.005,
+      "truth_scaling": 10.0,
+      "max_truth_iters": 3
     },
     {
       "name": "esfl",
       "label": "ESFL",
       "aggregator": "esfl",
-      "fractions": [0.4, 0.8]
+      "fractions": [
+        0.4,
+        0.6
+      ]
     },
     {
       "name": "ppfdl",
       "label": "PPFDL",
       "aggregator": "ppfdl",
-      "fractions": [0.4, 0.8]
+      "fractions": [
+        0.4,
+        0.6
+      ]
     }
   ],
   "output": {
