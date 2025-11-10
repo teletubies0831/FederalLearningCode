@@ -47,6 +47,8 @@ class FederatedTrainer:
         weight_decay: float = 0.0,
         aggregator_factory: Optional[Callable[[int, int], AggregationControllerProtocol]] = None,
         low_quality_clients: Optional[Sequence[int]] = None,
+        evaluate_clients: bool = False,
+        client_eval_max_batches: Optional[int] = None,
     ) -> None:
         self.model_builder = model_builder
         self.client_loaders = client_loaders
@@ -66,6 +68,8 @@ class FederatedTrainer:
         else:
             self.aggregator_factory = aggregator_factory
         self.low_quality_clients = set(low_quality_clients or [])
+        self.evaluate_clients = evaluate_clients
+        self.client_eval_max_batches = client_eval_max_batches
 
     def train(
         self,
@@ -104,11 +108,18 @@ class FederatedTrainer:
             print(f"Round {round_idx:03d}/{num_rounds:03d} | Active clients: {active_clients}")
 
             if metrics_by_client:
-                detailed_metrics = ", ".join(
-                    f"client {metric['client_id']}: acc={metric['test_accuracy']:.4f}"
-                    for metric in metrics_by_client
-                )
-                print(f"    Pre-aggregation test accuracy -> {detailed_metrics}")
+                formatted_metrics: List[str] = []
+                for metric in metrics_by_client:
+                    client_id = int(metric.get("client_id", -1))
+                    parts = [f"client {client_id}"]
+                    if "training_loss" in metric:
+                        parts.append(f"train_loss={metric['training_loss']:.4f}")
+                    if "test_accuracy" in metric:
+                        parts.append(f"acc={metric['test_accuracy']:.4f}")
+                    formatted_metrics.append(
+                        ": ".join([parts[0], ", ".join(parts[1:])]) if len(parts) > 1 else parts[0]
+                    )
+                print(f"    Pre-aggregation metrics -> {', '.join(formatted_metrics)}")
 
             aggregated_state, aggregation_weights = aggregator.aggregate(
                 global_state, client_reports
@@ -184,14 +195,17 @@ class FederatedTrainer:
                 )
             )
 
-            pre_loss, pre_acc = self.evaluate(client_model)
-            client_metrics.append(
-                {
-                    "client_id": client_id,
-                    "test_loss": pre_loss,
-                    "test_accuracy": pre_acc,
-                }
-            )
+            metric_entry: Dict[str, float] = {
+                "client_id": float(client_id),
+                "training_loss": training_loss,
+            }
+            if self.evaluate_clients:
+                pre_loss, pre_acc = self.evaluate(
+                    client_model,
+                    max_batches=self.client_eval_max_batches,
+                )
+                metric_entry.update({"test_loss": pre_loss, "test_accuracy": pre_acc})
+            client_metrics.append(metric_entry)
 
         return reports, client_metrics
 
@@ -226,7 +240,11 @@ class FederatedTrainer:
 
         return cumulative_loss / max(num_batches, 1)
 
-    def evaluate(self, model: nn.Module) -> Tuple[float, float]:
+    def evaluate(
+        self,
+        model: nn.Module,
+        max_batches: Optional[int] = None,
+    ) -> Tuple[float, float]:
         """Evaluate ``model`` on the shared test set."""
 
         model.eval()
@@ -236,7 +254,9 @@ class FederatedTrainer:
         total_samples = 0
 
         with torch.no_grad():
-            for images, targets in self.test_loader:
+            for batch_idx, (images, targets) in enumerate(self.test_loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 logits = model(images)
@@ -245,6 +265,9 @@ class FederatedTrainer:
                 predictions = logits.argmax(dim=1)
                 total_correct += (predictions == targets).sum().item()
                 total_samples += images.size(0)
+
+        if total_samples == 0:
+            return float("nan"), float("nan")
 
         mean_loss = total_loss / total_samples
         accuracy = total_correct / total_samples

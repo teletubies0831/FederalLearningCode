@@ -25,6 +25,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--dropout-rate", type=float, default=0.0, help="Probability that a client drops out in a round")
     parser.add_argument("--dropout-tolerance", type=int, default=0, help="Maximum number of tolerated dropouts per round")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of dataloader workers per client")
+    parser.add_argument(
+        "--disable-pin-memory",
+        action="store_true",
+        help="Disable CUDA pinned memory for dataloaders (enabled by default when CUDA is available)",
+    )
+    parser.add_argument(
+        "--client-metrics",
+        action="store_true",
+        help="Evaluate individual client models on the test set each round (slows training)",
+    )
+    parser.add_argument(
+        "--client-eval-batches",
+        type=int,
+        default=None,
+        help="Limit the number of test batches evaluated per client (used with --client-metrics)",
+    )
     parser.add_argument("--low-quality-fraction", type=float, default=0.0, help="Fraction of clients with degraded data")
     parser.add_argument("--label-noise", type=float, default=0.0, help="Probability of random label flips")
     parser.add_argument("--gaussian-noise-std", type=float, default=0.0, help="Standard deviation of additive Gaussian noise")
@@ -98,6 +115,8 @@ def main() -> None:
         low_quality_config=low_quality_config,
         seed=args.seed,
         data_dir=args.data_dir,
+        num_workers=args.num_workers,
+        pin_memory=None if not args.disable_pin_memory else False,
     )
 
     if args.dropout_tolerance >= len(data_bundle.client_loaders):
@@ -117,6 +136,8 @@ def main() -> None:
         dropout_tolerance=args.dropout_tolerance,
         weight_decay=args.weight_decay,
         low_quality_clients=data_bundle.low_quality_clients,
+        evaluate_clients=args.client_metrics,
+        client_eval_max_batches=args.client_eval_batches,
     )
 
     _, history = trainer.train(num_rounds=args.rounds, dropout_rate=args.dropout_rate)
