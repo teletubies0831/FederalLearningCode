@@ -261,6 +261,8 @@ def create_data_loaders(
     low_quality_config: Optional[Dict[str, object]] = None,
     seed: int = 42,
     data_dir: str = "data",
+    num_workers: int = 0,
+    pin_memory: Optional[bool] = None,
 ) -> FederatedDataBundle:
     """Prepare federated data loaders with optional low-quality clients.
 
@@ -280,6 +282,8 @@ def create_data_loaders(
         raise ValueError("num_clients must be positive")
 
     train_dataset, test_dataset, info = load_datasets(dataset_name, data_dir)
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
     rng = random.Random(seed)
     indices = list(range(len(train_dataset)))
     rng.shuffle(indices)  # 打乱整体样本次序，确保划分公平
@@ -314,10 +318,22 @@ def create_data_loaders(
             image_transform=image_transform,
             label_transform=label_transform,
         )
-        loader = DataLoader(client_dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(
+            client_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         client_loaders.append(loader)
 
-    test_loader = DataLoader(TransformedDataset(test_dataset, info.base_transform), batch_size=batch_size)
+    test_loader = DataLoader(
+        TransformedDataset(test_dataset, info.base_transform),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
     return FederatedDataBundle(
         client_loaders=client_loaders,
         test_loader=test_loader,
